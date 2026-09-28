@@ -10,11 +10,12 @@
  * entry via `configForms` on DSH >= 0.1.6 — key "position" either way):
  *   - "sidebar" (default): a DockKit right-sidebar tab (kind "terminal"),
  *     opened from the Desktop titlebar button or the sidebar guide.
- *   - "bottom": a dock card below the composer (`conversation.composer.dock`),
- *     inside the session column's layout flow — it lifts the composer and
- *     conversation up instead of overlaying them, mirroring Kimi Code
- *     Desktop's bottom panel. Drag the top edge to resize; the close button
- *     collapses it.
+ *   - "bottom": a full-width panel at the very bottom of the session column
+ *     (`conversation.composer.dock`, wrapped onto its own line below the
+ *     token meter via CSS). It rises from the bottom edge and pushes the
+ *     composer (input card and context meter stay glued together) plus the
+ *     conversation up, mirroring opencode's bottom panel. Drag the top edge
+ *     to resize; the close button collapses it.
  *   - "external": every entry point spawns the Desktop-native system
  *     terminal window instead (via the host's /dsh-terminal/open-native).
  * The selector itself is registered into the Plugins page detail of this
@@ -76,6 +77,14 @@ const CONFIG_ENTRY_ID = 'terminal-plugin'
 const BUNDLE_KEY = 'dsh-terminal-button'
 const POSITION_KEY = 'position'
 const POSITIONS = { sidebar: '右侧栏', bottom: '底部面板', external: '系统弹窗' }
+/**
+ * PSReadLine disables its ListView prediction — and prints a warning at every
+ * prompt — when the console window is smaller than 50x5. A hidden or
+ * freshly-mounted panel fits xterm to a degenerate 2x1, so the PTY geometry
+ * is floored at this minimum (host enforces the same floor as backstop).
+ */
+const MIN_COLS = 50
+const MIN_ROWS = 5
 
 const CSS = [
   xtermCss,
@@ -91,12 +100,20 @@ const CSS = [
   '.dsh-term-restart:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.2))}',
   '.dsh-term-title{display:inline-flex;align-items:center;gap:6px}',
   '.dsh-term-title svg{width:14px;height:14px;display:block}',
-  // bottom dock card (conversation.input.dock, sits in the session column flow).
-  // The conversation column's width-drag handle (._widthHandle) is absolutely
-  // positioned over the content's right edge with a hit area up to 40px wide
-  // in a stacking context we cannot out-z-index from inside the slot — so
-  // keep the dock head's controls clear of that strip with right padding.
-  '.dsh-term-dock{position:relative;z-index:30;display:flex;flex-direction:column;width:100%;box-sizing:border-box;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:12px;overflow:hidden}',
+  // Bottom dock card (conversation.composer.dock). The slot outlet renders
+  // inside the composer's bottom flex row — a horizontal line it shares with
+  // the context (token) meter, which would squeeze the panel into the middle.
+  // The :has() rule below turns that row into a wrapping, full-width line so
+  // the dock (order: 1, basis > 100%) lands on its own row BELOW the meter,
+  // and the negative side margins cancel the composer root's side clearance
+  // so the panel spans the whole conversation column (main-area width) and
+  // rises from the bottom edge — opencode-style. The conversation column's
+  // width-drag handle (._widthHandle) is absolutely positioned over the
+  // content's right edge in a stacking context we cannot out-z-index from
+  // inside the slot — so keep the dock head's controls clear of that strip
+  // with right padding.
+  'div:has(> [data-slot="conversation.composer.dock"] > .dsh-term-dock){width:100%;flex-wrap:wrap}',
+  '.dsh-term-dock{order:1;flex:none;box-sizing:border-box;width:calc(100% + var(--dsh-composer-side-clearance,16px) * 2);margin:0 calc(var(--dsh-composer-side-clearance,16px) * -1);position:relative;z-index:30;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:12px;overflow:hidden}',
   '.dsh-term-dock-head{position:relative;z-index:31;padding-right:52px}',
   '.dsh-term-dock-drag{flex:none;height:5px;cursor:row-resize}',
   '.dsh-term-dock-drag:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18))}',
@@ -425,72 +442,93 @@ function TerminalView({ ctx, sessionId, cwdHint, signal }) {
 
     let disposed = false
     let open = false
+    let ws = null
     const pending = []
-    const ws = new WebSocket(wsUrl(sessionId, cwdHint, term.cols, term.rows))
-    ws.binaryType = 'arraybuffer'
 
     const send = (message) => {
-      if (open && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message))
+      if (open && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message))
       else pending.push(message)
     }
 
-    ws.onopen = () => {
-      open = true
-      for (const message of pending.splice(0)) ws.send(JSON.stringify(message))
-    }
-    ws.onmessage = (event) => {
-      if (disposed) return
-      if (typeof event.data === 'string') {
-        let control
-        try {
-          control = JSON.parse(event.data)
-        } catch {
+    // Spawning the PTY while the panel is hidden or not yet laid out (the
+    // sidebar open animation, a display:none dock) fits xterm to a
+    // degenerate 2x1, and the shell inherits it as its console window —
+    // PowerShell's PSReadLine then warns at the first prompt. Defer the
+    // connection until the host element has a real box, and floor every
+    // geometry at the PSReadLine minimum.
+    const connect = () => {
+      if (disposed || ws) return
+      try {
+        fit.fit()
+      } catch { /* not measurable yet; the floored defaults still apply */ }
+      ws = new WebSocket(wsUrl(sessionId, cwdHint, Math.max(MIN_COLS, term.cols), Math.max(MIN_ROWS, term.rows)))
+      ws.binaryType = 'arraybuffer'
+
+      ws.onopen = () => {
+        open = true
+        for (const message of pending.splice(0)) ws.send(JSON.stringify(message))
+      }
+      ws.onmessage = (event) => {
+        if (disposed) return
+        if (typeof event.data === 'string') {
+          let control
+          try {
+            control = JSON.parse(event.data)
+          } catch {
+            return
+          }
+          if (control?.type === 'ready') {
+            setState('ready')
+            setInfo({ cwd: control.cwd, shell: control.shell, pid: control.pid })
+          } else if (control?.type === 'exit') {
+            setState('exit')
+            setInfo((prev) => ({ ...prev, exitCode: control.exitCode }))
+            term.write(`\r\n\x1b[2m[进程已退出，退出码 ${String(control.exitCode ?? '?')}]\x1b[0m\r\n`)
+          } else if (control?.type === 'error') {
+            setState('error')
+            setInfo({ message: control.message })
+            term.write(`\r\n\x1b[31m${control.message}\x1b[0m\r\n`)
+          }
           return
         }
-        if (control?.type === 'ready') {
-          setState('ready')
-          setInfo({ cwd: control.cwd, shell: control.shell, pid: control.pid })
-        } else if (control?.type === 'exit') {
-          setState('exit')
-          setInfo((prev) => ({ ...prev, exitCode: control.exitCode }))
-          term.write(`\r\n\x1b[2m[进程已退出，退出码 ${String(control.exitCode ?? '?')}]\x1b[0m\r\n`)
-        } else if (control?.type === 'error') {
-          setState('error')
-          setInfo({ message: control.message })
-          term.write(`\r\n\x1b[31m${control.message}\x1b[0m\r\n`)
+        term.write(new Uint8Array(event.data))
+      }
+      ws.onclose = (event) => {
+        if (disposed) return
+        // A close during the handshake is a connection failure, not a shell exit.
+        // Browsers give no detail on onerror; the close code is the only signal.
+        setState((prev) => {
+          if (prev === 'ready') return 'exit'
+          if (prev === 'connecting') return 'error'
+          return prev
+        })
+        if (event && event.code !== 1000) {
+          const detail = `WebSocket 已关闭（code ${event.code}${event.reason ? `：${event.reason}` : ''}）`
+          setInfo((prev) => (prev?.message ? prev : { ...prev, message: detail }))
         }
-        return
       }
-      term.write(new Uint8Array(event.data))
-    }
-    ws.onclose = (event) => {
-      if (disposed) return
-      // A close during the handshake is a connection failure, not a shell exit.
-      // Browsers give no detail on onerror; the close code is the only signal.
-      setState((prev) => {
-        if (prev === 'ready') return 'exit'
-        if (prev === 'connecting') return 'error'
-        return prev
-      })
-      if (event && event.code !== 1000) {
-        const detail = `WebSocket 已关闭（code ${event.code}${event.reason ? `：${event.reason}` : ''}）`
-        setInfo((prev) => (prev?.message ? prev : { ...prev, message: detail }))
+      ws.onerror = () => {
+        if (disposed) return
+        setState((prev) => (prev === 'connecting' ? 'error' : prev))
+        setInfo((prev) => (prev?.message ? prev : { message: 'WebSocket 连接失败' }))
       }
-    }
-    ws.onerror = () => {
-      if (disposed) return
-      setState((prev) => (prev === 'connecting' ? 'error' : prev))
-      setInfo((prev) => (prev?.message ? prev : { message: 'WebSocket 连接失败' }))
     }
 
     const dataSub = term.onData((data) => send({ type: 'input', data }))
-    const resizeSub = term.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
+    const resizeSub = term.onResize(({ cols, rows }) => send({
+      type: 'resize',
+      cols: Math.max(MIN_COLS, cols),
+      rows: Math.max(MIN_ROWS, rows),
+    }))
     const observer = new ResizeObserver(() => {
+      if (!ws && el.clientWidth > 0 && el.clientHeight > 0) connect()
       try {
         fit.fit()
       } catch { /* hidden or zero-size */ }
     })
     observer.observe(el)
+    // Fast path: the panel is usually already laid out at mount.
+    if (el.clientWidth > 0 && el.clientHeight > 0) connect()
 
     const applyTheme = () => {
       term.options.theme = readTheme()
@@ -516,9 +554,11 @@ function TerminalView({ ctx, sessionId, cwdHint, signal }) {
       el.removeEventListener('paste', onPaste, true)
       el.removeEventListener('mouseup', onSelectCopy)
       el.removeEventListener('contextmenu', onContextMenu)
-      try {
-        ws.close()
-      } catch { /* already closed */ }
+      if (ws) {
+        try {
+          ws.close()
+        } catch { /* already closed */ }
+      }
       term.dispose()
     }
 
@@ -571,7 +611,7 @@ function TerminalTitle(props) {
 }
 
 // ---------------------------------------------------------------------------
-// Bottom dock placement (conversation.input.dock, session scope)
+// Bottom dock placement (conversation.composer.dock, session scope)
 // ---------------------------------------------------------------------------
 
 function TerminalDock(props, ctx) {
@@ -783,6 +823,11 @@ export function apply(ctx) {
     TerminalTitle,
   ))
 
+  // conversation.composer.dock renders inside the composer card's bottom
+  // row, after the input card — the CSS above wraps that row so the dock
+  // takes a full-width line below the token meter, at the very bottom of the
+  // session column. (conversation.input.dock renders ABOVE the input card,
+  // which is the wrong end of the composer.)
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register(
     {
       name: 'conversation.composer.dock',
@@ -803,18 +848,17 @@ export function apply(ctx) {
     TerminalHeaderButton,
   ))
 
+  // DSH >= 0.1.6: 插件 → 插件列表 → 本插件详情。不要用 whileServed 把门：
+  // Host 一旦没把 terminal-plugin 认成可服务的 volatile 条目（旧 schemastery
+  // 没有 .volatile() 时就会这样），选择器整段消失，位置就改不了。
+  // 这个 client 半部能加载，就说明本包已经在 profile 里，配置区应当常驻。
+  ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register(
+    { name: 'plugins.bundle.config', key: BUNDLE_KEY },
+    TerminalPositionConfigPage,
+  ))
+
   const configForms = typeof ctx.get === 'function' ? ctx.get('configForms') : undefined
-  if (typeof configForms?.whileServed === 'function') {
-    // DSH >= 0.1.6: 插件 → 插件列表 → 本插件详情。只在 Host 真的在提供
-    // 这条配置时挂上，避免没装插件的 profile 里冒出空配置区。
-    ctx.effect(() => configForms.whileServed([CONFIG_ENTRY_ID], () => ctx.slots.inject(
-      'plugins.bundle.config',
-      () => ctx.slots.register(
-        { name: 'plugins.bundle.config', key: BUNDLE_KEY },
-        TerminalPositionConfigPage,
-      ),
-    )), 'dsh-terminal-button: plugins page')
-  } else {
+  if (typeof configForms?.whileServed !== 'function') {
     // DSH <= 0.1.5 has no Plugins detail slot.
     ctx.slots.inject('settings.general.item', () => ctx.slots.register(
       {

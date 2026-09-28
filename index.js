@@ -44,19 +44,36 @@ export const inject = ['webServer', 'subprocess']
 const SETTINGS_NAMESPACE = 'dsh-terminal-button'
 
 /**
- * Mark a schema field volatile when the runtime's schemastery supports it
- * (DSH >= 0.1.6). Volatile fields are editable through the client's
- * configuration forms and hot-committed into the running fiber's references;
- * older runtimes lack the method and keep the field a plain default.
+ * Mark a schema field volatile so DSH settings.describe() serves it and
+ * Loader hot-commits writes. Prefer `.volatile()` (schemastery >= 3.18.4).
+ * Older copies used to ship with this plugin had `.extra()` but no
+ * `.volatile()`, which left `position` as ordinary config: the Plugins
+ * page never listed the entry, and the placement control disappeared.
  */
-const maybeVolatile = (schema) => (schema && typeof schema.volatile === 'function' ? schema.volatile() : schema)
+const markVolatile = (schema) => {
+  if (!schema) return schema
+  if (typeof schema.volatile === 'function') {
+    try {
+      return schema.volatile()
+    } catch {
+      return schema
+    }
+  }
+  if (typeof schema.extra === 'function') return schema.extra('volatile', true)
+  if (schema.meta) schema.meta.volatile = true
+  return schema
+}
+
+const positionSchema = Schema
+  ? markVolatile(Schema.union(['sidebar', 'bottom', 'external']).default('sidebar'))
+  : undefined
 
 /** Client placement setting; user layer lives in $DSH_HOME/settings.yaml (<= 0.1.5). */
 const SettingsSchema = Schema?.object({
   // Where "open terminal" goes: an in-app panel ('sidebar' | 'bottom') or
   // the Desktop-native system terminal window ('external'). The host half
   // reads this to gate its desktopRuntime.openTerminal interception.
-  position: Schema.union(['sidebar', 'bottom', 'external']).default('sidebar'),
+  position: positionSchema,
 })
 
 /**
@@ -66,7 +83,7 @@ const SettingsSchema = Schema?.object({
  * form and hot-committed into this fiber on every write.
  */
 export const Config = SettingsSchema
-  ? Schema.object({ position: maybeVolatile(Schema.union(['sidebar', 'bottom', 'external']).default('sidebar')) })
+  ? Schema.object({ position: positionSchema })
   : undefined
 
 const UPGRADE_PATH = '/dsh-terminal/pty'
@@ -79,6 +96,14 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 /** Reject absurd terminal geometries from a confused client. */
 const MAX_COLS = 500
 const MAX_ROWS = 200
+/**
+ * PSReadLine disables its ListView prediction and warns at every prompt when
+ * the console window is smaller than 50x5. The client floors its geometry at
+ * this minimum; enforce it host-side too so a stale/foreign client can never
+ * spawn or shrink a PTY below it.
+ */
+const MIN_COLS = 50
+const MIN_ROWS = 5
 
 // ---------------------------------------------------------------------------
 // Minimal RFC 6455 framing (server side: accepts masked client frames,
@@ -299,8 +324,8 @@ async function handleConnection(ctx, req, socket, head) {
   const sessionId = query.get('sessionId') || ''
   const cwd = await resolveCwd(ctx, sessionId, query.get('cwd'))
   const { argv } = pickShell(query)
-  const cols = clampDimension(query.get('cols'), MAX_COLS, 80)
-  const rows = clampDimension(query.get('rows'), MAX_ROWS, 24)
+  const cols = Math.max(MIN_COLS, clampDimension(query.get('cols'), MAX_COLS, 80))
+  const rows = Math.max(MIN_ROWS, clampDimension(query.get('rows'), MAX_ROWS, 24))
 
   let handle
   try {
@@ -386,8 +411,8 @@ async function handleConnection(ctx, req, socket, head) {
       if (decoded?.type === 'input' && typeof decoded.data === 'string') {
         handle.write(decoded.data).catch(() => {})
       } else if (decoded?.type === 'resize') {
-        const nextCols = clampDimension(decoded.cols, MAX_COLS, cols)
-        const nextRows = clampDimension(decoded.rows, MAX_ROWS, rows)
+        const nextCols = Math.max(MIN_COLS, clampDimension(decoded.cols, MAX_COLS, cols))
+        const nextRows = Math.max(MIN_ROWS, clampDimension(decoded.rows, MAX_ROWS, rows))
         // DSH <= 0.1.5 nested the pty on handle.terminal; 0.1.7 exposes resize
         // directly on the terminal handle.
         const resize = typeof handle.resize === 'function'

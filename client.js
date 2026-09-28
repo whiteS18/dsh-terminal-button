@@ -6380,6 +6380,8 @@ var CONFIG_ENTRY_ID = "terminal-plugin";
 var BUNDLE_KEY = "dsh-terminal-button";
 var POSITION_KEY = "position";
 var POSITIONS = { sidebar: "\u53F3\u4FA7\u680F", bottom: "\u5E95\u90E8\u9762\u677F", external: "\u7CFB\u7EDF\u5F39\u7A97" };
+var MIN_COLS = 50;
+var MIN_ROWS = 5;
 var CSS = [
   xterm_default,
   ".dsh-term-panel{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}",
@@ -6394,12 +6396,20 @@ var CSS = [
   ".dsh-term-restart:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.2))}",
   ".dsh-term-title{display:inline-flex;align-items:center;gap:6px}",
   ".dsh-term-title svg{width:14px;height:14px;display:block}",
-  // bottom dock card (conversation.input.dock, sits in the session column flow).
-  // The conversation column's width-drag handle (._widthHandle) is absolutely
-  // positioned over the content's right edge with a hit area up to 40px wide
-  // in a stacking context we cannot out-z-index from inside the slot — so
-  // keep the dock head's controls clear of that strip with right padding.
-  ".dsh-term-dock{position:relative;z-index:30;display:flex;flex-direction:column;width:100%;box-sizing:border-box;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:12px;overflow:hidden}",
+  // Bottom dock card (conversation.composer.dock). The slot outlet renders
+  // inside the composer's bottom flex row — a horizontal line it shares with
+  // the context (token) meter, which would squeeze the panel into the middle.
+  // The :has() rule below turns that row into a wrapping, full-width line so
+  // the dock (order: 1, basis > 100%) lands on its own row BELOW the meter,
+  // and the negative side margins cancel the composer root's side clearance
+  // so the panel spans the whole conversation column (main-area width) and
+  // rises from the bottom edge — opencode-style. The conversation column's
+  // width-drag handle (._widthHandle) is absolutely positioned over the
+  // content's right edge in a stacking context we cannot out-z-index from
+  // inside the slot — so keep the dock head's controls clear of that strip
+  // with right padding.
+  'div:has(> [data-slot="conversation.composer.dock"] > .dsh-term-dock){width:100%;flex-wrap:wrap}',
+  ".dsh-term-dock{order:1;flex:none;box-sizing:border-box;width:calc(100% + var(--dsh-composer-side-clearance,16px) * 2);margin:0 calc(var(--dsh-composer-side-clearance,16px) * -1);position:relative;z-index:30;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:12px;overflow:hidden}",
   ".dsh-term-dock-head{position:relative;z-index:31;padding-right:52px}",
   ".dsh-term-dock-drag{flex:none;height:5px;cursor:row-resize}",
   ".dsh-term-dock-drag:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18))}",
@@ -6667,72 +6677,86 @@ function TerminalView({ ctx, sessionId, cwdHint, signal }) {
     el.addEventListener("contextmenu", onContextMenu);
     let disposed = false;
     let open = false;
+    let ws = null;
     const pending = [];
-    const ws = new WebSocket(wsUrl(sessionId, cwdHint, term.cols, term.rows));
-    ws.binaryType = "arraybuffer";
     const send = (message) => {
-      if (open && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+      if (open && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
       else pending.push(message);
     };
-    ws.onopen = () => {
-      open = true;
-      for (const message of pending.splice(0)) ws.send(JSON.stringify(message));
-    };
-    ws.onmessage = (event) => {
-      if (disposed) return;
-      if (typeof event.data === "string") {
-        let control;
-        try {
-          control = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (control?.type === "ready") {
-          setState("ready");
-          setInfo({ cwd: control.cwd, shell: control.shell, pid: control.pid });
-        } else if (control?.type === "exit") {
-          setState("exit");
-          setInfo((prev) => ({ ...prev, exitCode: control.exitCode }));
-          term.write(`\r
+    const connect = () => {
+      if (disposed || ws) return;
+      try {
+        fit.fit();
+      } catch {
+      }
+      ws = new WebSocket(wsUrl(sessionId, cwdHint, Math.max(MIN_COLS, term.cols), Math.max(MIN_ROWS, term.rows)));
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        open = true;
+        for (const message of pending.splice(0)) ws.send(JSON.stringify(message));
+      };
+      ws.onmessage = (event) => {
+        if (disposed) return;
+        if (typeof event.data === "string") {
+          let control;
+          try {
+            control = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          if (control?.type === "ready") {
+            setState("ready");
+            setInfo({ cwd: control.cwd, shell: control.shell, pid: control.pid });
+          } else if (control?.type === "exit") {
+            setState("exit");
+            setInfo((prev) => ({ ...prev, exitCode: control.exitCode }));
+            term.write(`\r
 \x1B[2m[\u8FDB\u7A0B\u5DF2\u9000\u51FA\uFF0C\u9000\u51FA\u7801 ${String(control.exitCode ?? "?")}]\x1B[0m\r
 `);
-        } else if (control?.type === "error") {
-          setState("error");
-          setInfo({ message: control.message });
-          term.write(`\r
+          } else if (control?.type === "error") {
+            setState("error");
+            setInfo({ message: control.message });
+            term.write(`\r
 \x1B[31m${control.message}\x1B[0m\r
 `);
+          }
+          return;
         }
-        return;
-      }
-      term.write(new Uint8Array(event.data));
-    };
-    ws.onclose = (event) => {
-      if (disposed) return;
-      setState((prev) => {
-        if (prev === "ready") return "exit";
-        if (prev === "connecting") return "error";
-        return prev;
-      });
-      if (event && event.code !== 1e3) {
-        const detail = `WebSocket \u5DF2\u5173\u95ED\uFF08code ${event.code}${event.reason ? `\uFF1A${event.reason}` : ""}\uFF09`;
-        setInfo((prev) => prev?.message ? prev : { ...prev, message: detail });
-      }
-    };
-    ws.onerror = () => {
-      if (disposed) return;
-      setState((prev) => prev === "connecting" ? "error" : prev);
-      setInfo((prev) => prev?.message ? prev : { message: "WebSocket \u8FDE\u63A5\u5931\u8D25" });
+        term.write(new Uint8Array(event.data));
+      };
+      ws.onclose = (event) => {
+        if (disposed) return;
+        setState((prev) => {
+          if (prev === "ready") return "exit";
+          if (prev === "connecting") return "error";
+          return prev;
+        });
+        if (event && event.code !== 1e3) {
+          const detail = `WebSocket \u5DF2\u5173\u95ED\uFF08code ${event.code}${event.reason ? `\uFF1A${event.reason}` : ""}\uFF09`;
+          setInfo((prev) => prev?.message ? prev : { ...prev, message: detail });
+        }
+      };
+      ws.onerror = () => {
+        if (disposed) return;
+        setState((prev) => prev === "connecting" ? "error" : prev);
+        setInfo((prev) => prev?.message ? prev : { message: "WebSocket \u8FDE\u63A5\u5931\u8D25" });
+      };
     };
     const dataSub = term.onData((data) => send({ type: "input", data }));
-    const resizeSub = term.onResize(({ cols, rows }) => send({ type: "resize", cols, rows }));
+    const resizeSub = term.onResize(({ cols, rows }) => send({
+      type: "resize",
+      cols: Math.max(MIN_COLS, cols),
+      rows: Math.max(MIN_ROWS, rows)
+    }));
     const observer = new ResizeObserver(() => {
+      if (!ws && el.clientWidth > 0 && el.clientHeight > 0) connect();
       try {
         fit.fit();
       } catch {
       }
     });
     observer.observe(el);
+    if (el.clientWidth > 0 && el.clientHeight > 0) connect();
     const applyTheme = () => {
       term.options.theme = readTheme();
       term.options.fontFamily = terminalFontFamily();
@@ -6755,9 +6779,11 @@ function TerminalView({ ctx, sessionId, cwdHint, signal }) {
       el.removeEventListener("paste", onPaste, true);
       el.removeEventListener("mouseup", onSelectCopy);
       el.removeEventListener("contextmenu", onContextMenu);
-      try {
-        ws.close();
-      } catch {
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+        }
       }
       term.dispose();
     }
@@ -6935,16 +6961,12 @@ function apply(ctx) {
     },
     TerminalHeaderButton
   ));
+  ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register(
+    { name: "plugins.bundle.config", key: BUNDLE_KEY },
+    TerminalPositionConfigPage
+  ));
   const configForms = typeof ctx.get === "function" ? ctx.get("configForms") : void 0;
-  if (typeof configForms?.whileServed === "function") {
-    ctx.effect(() => configForms.whileServed([CONFIG_ENTRY_ID], () => ctx.slots.inject(
-      "plugins.bundle.config",
-      () => ctx.slots.register(
-        { name: "plugins.bundle.config", key: BUNDLE_KEY },
-        TerminalPositionConfigPage
-      )
-    )), "dsh-terminal-button: plugins page");
-  } else {
+  if (typeof configForms?.whileServed !== "function") {
     ctx.slots.inject("settings.general.item", () => ctx.slots.register(
       {
         name: "settings.general.item",

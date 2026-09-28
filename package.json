@@ -1,6 +1,6 @@
 {
   "name": "dsh-terminal-button",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Embedded terminal for DeepSeek Harness: opens an in-app terminal panel in the right sidebar (DockKit) instead of spawning a system terminal window. Follows the DSH theme and starts in the session workspace root.",
   "keywords": [
     "deepseek",
@@ -61,6 +61,6 @@
     "esbuild": "^0.25.0"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/schemastery": "~3.18.4"
   }
 }
