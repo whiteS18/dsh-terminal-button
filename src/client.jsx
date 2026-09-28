@@ -274,8 +274,11 @@ function createSettingStore(scope, key, fallback) {
  * DSH <= 0.1.5 exposes the `settingsScope` service; DSH >= 0.1.6 replaced it
  * with `configForms` over the loader entry declared in cordis.patch.yml
  * (`terminal-plugin`), whose volatile `position` field carries the same value.
- * Writes go through `mutate` with the revision the form was read at — `set`
- * races a describe() that bumps the revision on every read and gets refused.
+ * Writes go through `mutate` without a caller revision. DSH 0.2 calls
+ * `describe()` inside the write, and that call itself bumps the revision
+ * whenever the fingerprint changes, so a revision captured before the click
+ * is already stale and the host refuses it as a conflict. The form queue
+ * still fences later writes with the revision the host just answered.
  */
 function bindPositionStore(ctx) {
   const settingsScope = typeof ctx.get === 'function' ? ctx.get('settingsScope') : undefined
@@ -297,11 +300,7 @@ function bindPositionStore(ctx) {
         return scope.subscribe(callback)
       },
       set(value) {
-        const snap = scope.getSnapshot()
-        const write = scope.mutate(
-          [{ op: 'set', path: [POSITION_KEY], value }],
-          snap?.revision,
-        )
+        const write = scope.mutate([{ op: 'set', path: [POSITION_KEY], value }])
         return Promise.resolve(write).then((accepted) => {
           if (accepted === false) {
             const message = '终端位置没有保存（配置被拒绝）'

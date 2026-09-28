@@ -6551,11 +6551,7 @@ function bindPositionStore(ctx) {
         return scope.subscribe(callback);
       },
       set(value) {
-        const snap = scope.getSnapshot();
-        const write = scope.mutate(
-          [{ op: "set", path: [POSITION_KEY], value }],
-          snap?.revision
-        );
+        const write = scope.mutate([{ op: "set", path: [POSITION_KEY], value }]);
         return Promise.resolve(write).then((accepted) => {
           if (accepted === false) {
             const message = "\u7EC8\u7AEF\u4F4D\u7F6E\u6CA1\u6709\u4FDD\u5B58\uFF08\u914D\u7F6E\u88AB\u62D2\u7EDD\uFF09";
