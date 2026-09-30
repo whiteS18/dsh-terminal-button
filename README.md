@@ -6,6 +6,7 @@ DeepSeek Harness 插件：把「打开终端」从弹出系统默认终端窗口
 
 - **内嵌终端**：会话头部工具栏新增终端图标按钮（Lucide `SquareTerminal`，与 DSH 标题栏原生终端按钮同一图标），点击即打开内嵌终端。终端渲染用 [@xterm/xterm](https://www.npmjs.com/package/@xterm/xterm)（构建时内联进 `client.js`）
 - **位置可配置**：插件 → 插件列表 → 本插件详情里的「终端显示位置」（原生 Menu 下拉；DSH 0.1.5 及更早仍在设置 → 通用）可选 **右侧栏**（DockKit Tab，支持分栏/浮动/折叠，默认）、**底部面板**（`conversation.composer.dock`，会话列最底部、token 用量表下方独占一行，与主界面同宽，从底部向上顶起输入框和对话内容而不遮挡——同 opencode 底部面板的做法；顶部拖拽调高度）或 **系统弹窗**。配置写入 profile 里 `terminal-plugin` 条目的 volatile `position` 字段，热更新、跨窗口同步。`position` 必须带 `meta.volatile`（schemastery ≥ 3.18.4 的 `.volatile()`，旧副本回退 `.extra('volatile', true)`），否则 Host 不服务该条目，详情页不会出现选择器
+- **底部终端不跟会话走**：底部面板的插槽是 session 作用域，切换会话会卸掉面板，但 shell 不是。同一个 xterm 和 PTY 会被摘下再挂上，不会新开进程、也不会清屏。关掉面板再打开还是这个 shell。要换一个新 shell，用状态栏的「重开终端」（工作目录取当前会话）
 - **主题跟随**：终端配色实时读取 DSH 的 CSS 设计变量（`--dsw-alias-bg-base` / `--dsw-alias-label-primary` 等），亮色 / 暗色切换、`theme/change` 事件都会即时刷新终端颜色与代码字体（`--ds-font-family-code`）
 - **工作区根目录**：PTY 的 cwd 由 Host 端根据会话 ID 解析（活跃会话 → 持久化会话日志 → 前端提示 → 沙箱根目录），**始终是当前会话工作区根目录，而不是 DSH 的 profile 目录**
 - **状态栏**：面板底部显示运行状态（连接中 / 运行中 / 已退出 / 错误）与 cwd；Shell 退出后可一键「重开终端」
@@ -63,7 +64,9 @@ dsh-terminal-button/
   正文与标题分别 keyed 注册到 `sidebar.right.pane.tab` / `sidebar.right.pane.tab.title`；
   底部面板形态注册到 `conversation.composer.dock`（session 作用域，composer 卡片底部行内；
   CSS 把该行换行成整宽、独占一行置于 token 用量表下方，负边距抵消 composer 的左右留白，
-  面板与主界面同宽、从最底部顶起，不遮挡任何内容）；
+  面板与主界面同宽、从最底部顶起，不遮挡任何内容）。这个插槽会随会话卸载，
+  所以底部终端的 xterm/PTY 放在页面级 registry 里：卸载只 `detach` 到屏幕外，
+  下一次挂载再 `attach`，不重新握手；`dispose` 只发生在「重开终端」和插件卸载；
   按钮注册到 `conversation.session.header.utilities`（order -20），按配置分发到侧栏或底部；
   「终端显示位置」注册到插件详情的 `plugins.bundle.config`（包名 `dsh-terminal-button`），
   值经 `configForms.get('terminal-plugin')` 写入 profile patch；DSH 0.1.5 及更早仍走 `settings.general.item`。

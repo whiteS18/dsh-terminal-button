@@ -15,7 +15,10 @@
  *     token meter via CSS). It rises from the bottom edge and pushes the
  *     composer (input card and context meter stay glued together) plus the
  *     conversation up, mirroring opencode's bottom panel. Drag the top edge
- *     to resize; the close button collapses it.
+ *     to resize; the close button collapses the panel without killing the
+ *     shell. The slot is session-scoped, so switching sessions unmounts the
+ *     panel; the shell is not — the same xterm and PTY are parked and
+ *     reattached instead of being spawned again.
  *   - "external": every entry point spawns the Desktop-native system
  *     terminal window instead (via the host's /dsh-terminal/open-native).
  * The selector itself is registered into the Plugins page detail of this
@@ -41,11 +44,11 @@
  * client only sends its session cwd as a fallback hint.
  */
 import React from 'react'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import xtermCss from '@xterm/xterm/css/xterm.css'
+import { createPinnedRegistry } from './pinned-terminal.js'
+import { createTerminalController } from './terminal-session.js'
 
 const { Menu } = primitives
 // Icon exports were renamed in DSH 0.1.7 (size suffix dropped for Regular/
@@ -89,6 +92,7 @@ const MIN_ROWS = 5
 const CSS = [
   xtermCss,
   '.dsh-term-panel{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}',
+  '.dsh-term-slot{flex:1;min-height:0;display:flex;flex-direction:column}',
   '.dsh-term-view{flex:1;min-height:0;padding:6px 4px 4px 10px;overflow:hidden}',
   '.dsh-term-view .xterm{height:100%}',
   '.dsh-term-status{display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.2));font-size:11px;color:var(--dsw-alias-label-tertiary,#999);white-space:nowrap;overflow:hidden}',
@@ -342,244 +346,118 @@ function useDock() {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal core (xterm + websocket), shared by sidebar tab and bottom dock
+// Terminal core (xterm + websocket), shared by sidebar tab and bottom dock.
+// The bottom dock pins one controller for the life of the page: session
+// switches unmount the slot, but detach() only parks the DOM.
 // ---------------------------------------------------------------------------
 
-function TerminalView({ ctx, sessionId, cwdHint, signal }) {
-  const hostRef = React.useRef(null)
+const PINNED_EMPTY = Object.freeze({ state: 'connecting', info: null, boundCwd: '' })
+const pinnedTerminals = createPinnedRegistry()
+
+function terminalEnv() {
+  return {
+    wsUrl,
+    readTheme,
+    terminalFontFamily,
+    minCols: MIN_COLS,
+    minRows: MIN_ROWS,
+  }
+}
+
+function usePinnedGeneration() {
+  return React.useSyncExternalStore(
+    (callback) => pinnedTerminals.subscribe(callback),
+    () => pinnedTerminals.generation,
+  )
+}
+
+function usePinnedSnapshot() {
+  return React.useSyncExternalStore(
+    (callback) => pinnedTerminals.subscribe(callback),
+    () => pinnedTerminals.current?.getSnapshot() ?? PINNED_EMPTY,
+  )
+}
+
+function TerminalView({ ctx, sessionId, cwdHint, signal, pinned = false }) {
+  const slotRef = React.useRef(null)
   const [attempt, setAttempt] = React.useState(0)
-  const [state, setState] = React.useState('connecting')
-  const [info, setInfo] = React.useState(null)
+  const generation = usePinnedGeneration()
+  const hints = React.useRef({ ctx, sessionId, cwdHint })
+  hints.current = { ctx, sessionId, cwdHint }
+  const [snapshot, setSnapshot] = React.useState(() => (
+    pinned
+      ? (pinnedTerminals.current?.getSnapshot() ?? { state: 'connecting', info: null, boundCwd: cwdHint || '' })
+      : { state: 'connecting', info: null, boundCwd: cwdHint || '' }
+  ))
 
-  React.useEffect(() => {
-    const el = hostRef.current
-    if (!el || !sessionId) return undefined
-
-    const term = new Terminal({
-      cursorBlink: true,
-      cursorStyle: 'bar',
-      fontSize: 13,
-      fontFamily: terminalFontFamily(),
-      scrollback: 10000,
-      theme: readTheme(),
+  const createPinned = React.useCallback(() => {
+    const hint = hints.current
+    return createTerminalController(terminalEnv(), {
+      ctx: hint.ctx,
+      sessionId: hint.sessionId,
+      cwdHint: hint.cwdHint,
+      onSnapshot: () => pinnedTerminals.notify(),
     })
-    const fit = new FitAddon()
-    term.loadAddon(fit)
-    term.open(el)
-    try {
-      fit.fit()
-    } catch { /* container not laid out yet; ResizeObserver will retry */ }
-    term.focus()
+  }, [])
 
-    // xterm forwards Ctrl+C to the shell as SIGINT and never copies, and it
-    // swallows the keydown before a DOM listener can see it. Ctrl+Shift+C is
-    // claimed here so it copies instead of sending a modified Ctrl+C. A plain
-    // Ctrl+C is left untouched: the copy event below writes the selection,
-    // and xterm still delivers the interrupt when nothing is selected.
-    // Ctrl+Shift+V pastes. Right-click copies a selection, otherwise pastes.
-    const writeClipboard = (text) => {
-      if (!text) return
-      const clipboard = navigator.clipboard
-      if (clipboard?.writeText) {
-        clipboard.writeText(text).catch(() => {})
-        return
-      }
-      try {
-        document.execCommand('copy')
-      } catch { /* clipboard unavailable */ }
+  // Bottom dock: reuse the pinned shell. sessionId is a dep so the first
+  // id to arrive can spawn, and later session switches only reattach.
+  React.useLayoutEffect(() => {
+    if (!pinned) return undefined
+    const slot = slotRef.current
+    if (!slot) return undefined
+    if (!hints.current.sessionId && !pinnedTerminals.current) return undefined
+    const controller = pinnedTerminals.acquire(createPinned)
+    setSnapshot(controller.getSnapshot())
+    const off = controller.subscribe(setSnapshot)
+    controller.attach(slot)
+    return () => {
+      off()
+      controller.detach()
     }
-    const readClipboard = () => {
-      const clipboard = navigator.clipboard
-      if (!clipboard?.readText) return Promise.resolve('')
-      return clipboard.readText().catch(() => '')
-    }
-    term.attachCustomKeyEventHandler((event) => {
-      const chord = event.ctrlKey || event.metaKey
-      if (event.type === 'keydown' && chord && event.shiftKey && event.code === 'KeyC') {
-        writeClipboard(term.getSelection())
-        return false
-      }
-      if (event.type === 'keydown' && chord && event.shiftKey && event.code === 'KeyV') {
-        // Chromium dispatches a native "paste as plain text" paste event for
-        // Ctrl+Shift+V in a textarea, and xterm does NOT preventDefault when
-        // this handler returns false — so without this guard the clipboard
-        // lands twice: once through the native paste event (onPaste below)
-        // and once through this async clipboard read.
-        event.preventDefault()
-        readClipboard().then((text) => { if (text) term.paste(text) })
-        return false
-      }
-      return true
-    })
-    const onCopy = (event) => {
-      const text = term.getSelection()
-      if (!text) return
-      event.preventDefault()
-      event.stopPropagation()
-      event.clipboardData?.setData('text/plain', text)
-    }
-    const onPaste = (event) => {
-      const text = event.clipboardData?.getData('text/plain')
-      if (!text) return
-      event.preventDefault()
-      event.stopPropagation()
-      term.paste(text)
-    }
-    // Copy once the pointer is released, not on every selection-change tick
-    // while the user is still dragging.
-    const onSelectCopy = (event) => {
-      if (event.button !== 0 || !term.hasSelection()) return
-      writeClipboard(term.getSelection())
-    }
-    const onContextMenu = (event) => {
-      const selection = term.getSelection()
-      if (selection) {
-        writeClipboard(selection)
-        return
-      }
-      event.preventDefault()
-      readClipboard().then((text) => { if (text) term.paste(text) })
-    }
-    el.addEventListener('copy', onCopy, true)
-    el.addEventListener('paste', onPaste, true)
-    el.addEventListener('mouseup', onSelectCopy)
-    el.addEventListener('contextmenu', onContextMenu)
+  }, [pinned, generation, sessionId, createPinned])
 
-    let disposed = false
-    let open = false
-    let ws = null
-    const pending = []
-
-    const send = (message) => {
-      if (open && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message))
-      else pending.push(message)
-    }
-
-    // Spawning the PTY while the panel is hidden or not yet laid out (the
-    // sidebar open animation, a display:none dock) fits xterm to a
-    // degenerate 2x1, and the shell inherits it as its console window —
-    // PowerShell's PSReadLine then warns at the first prompt. Defer the
-    // connection until the host element has a real box, and floor every
-    // geometry at the PSReadLine minimum.
-    const connect = () => {
-      if (disposed || ws) return
-      try {
-        fit.fit()
-      } catch { /* not measurable yet; the floored defaults still apply */ }
-      ws = new WebSocket(wsUrl(sessionId, cwdHint, Math.max(MIN_COLS, term.cols), Math.max(MIN_ROWS, term.rows)))
-      ws.binaryType = 'arraybuffer'
-
-      ws.onopen = () => {
-        open = true
-        for (const message of pending.splice(0)) ws.send(JSON.stringify(message))
-      }
-      ws.onmessage = (event) => {
-        if (disposed) return
-        if (typeof event.data === 'string') {
-          let control
-          try {
-            control = JSON.parse(event.data)
-          } catch {
-            return
-          }
-          if (control?.type === 'ready') {
-            setState('ready')
-            setInfo({ cwd: control.cwd, shell: control.shell, pid: control.pid })
-          } else if (control?.type === 'exit') {
-            setState('exit')
-            setInfo((prev) => ({ ...prev, exitCode: control.exitCode }))
-            term.write(`\r\n\x1b[2m[进程已退出，退出码 ${String(control.exitCode ?? '?')}]\x1b[0m\r\n`)
-          } else if (control?.type === 'error') {
-            setState('error')
-            setInfo({ message: control.message })
-            term.write(`\r\n\x1b[31m${control.message}\x1b[0m\r\n`)
-          }
-          return
-        }
-        term.write(new Uint8Array(event.data))
-      }
-      ws.onclose = (event) => {
-        if (disposed) return
-        // A close during the handshake is a connection failure, not a shell exit.
-        // Browsers give no detail on onerror; the close code is the only signal.
-        setState((prev) => {
-          if (prev === 'ready') return 'exit'
-          if (prev === 'connecting') return 'error'
-          return prev
-        })
-        if (event && event.code !== 1000) {
-          const detail = `WebSocket 已关闭（code ${event.code}${event.reason ? `：${event.reason}` : ''}）`
-          setInfo((prev) => (prev?.message ? prev : { ...prev, message: detail }))
-        }
-      }
-      ws.onerror = () => {
-        if (disposed) return
-        setState((prev) => (prev === 'connecting' ? 'error' : prev))
-        setInfo((prev) => (prev?.message ? prev : { message: 'WebSocket 连接失败' }))
-      }
-    }
-
-    const dataSub = term.onData((data) => send({ type: 'input', data }))
-    const resizeSub = term.onResize(({ cols, rows }) => send({
-      type: 'resize',
-      cols: Math.max(MIN_COLS, cols),
-      rows: Math.max(MIN_ROWS, rows),
-    }))
-    const observer = new ResizeObserver(() => {
-      if (!ws && el.clientWidth > 0 && el.clientHeight > 0) connect()
-      try {
-        fit.fit()
-      } catch { /* hidden or zero-size */ }
-    })
-    observer.observe(el)
-    // Fast path: the panel is usually already laid out at mount.
-    if (el.clientWidth > 0 && el.clientHeight > 0) connect()
-
-    const applyTheme = () => {
-      term.options.theme = readTheme()
-      term.options.fontFamily = terminalFontFamily()
-    }
-    const themeObserver = new MutationObserver(applyTheme)
-    themeObserver.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
-    const offTheme = typeof ctx.on === 'function' ? ctx.on('theme/change', applyTheme) : undefined
-
-    const onAbort = () => cleanup()
+  // Sidebar tab: one shell per mounted tab. Unmount (tab close, session
+  // switch) disposes it — that placement is session-scoped on purpose.
+  React.useLayoutEffect(() => {
+    if (pinned) return undefined
+    const slot = slotRef.current
+    if (!slot || !sessionId) return undefined
+    const controller = createTerminalController(terminalEnv(), { ctx, sessionId, cwdHint })
+    setSnapshot(controller.getSnapshot())
+    const off = controller.subscribe(setSnapshot)
+    controller.attach(slot)
+    const onAbort = () => controller.dispose()
     signal?.addEventListener('abort', onAbort, { once: true })
-
-    function cleanup() {
-      if (disposed) return
-      disposed = true
+    return () => {
+      off()
       signal?.removeEventListener('abort', onAbort)
-      themeObserver.disconnect()
-      observer.disconnect()
-      if (typeof offTheme === 'function') offTheme()
-      dataSub.dispose()
-      resizeSub.dispose()
-      el.removeEventListener('copy', onCopy, true)
-      el.removeEventListener('paste', onPaste, true)
-      el.removeEventListener('mouseup', onSelectCopy)
-      el.removeEventListener('contextmenu', onContextMenu)
-      if (ws) {
-        try {
-          ws.close()
-        } catch { /* already closed */ }
-      }
-      term.dispose()
+      controller.dispose()
     }
+  }, [pinned, sessionId, cwdHint, attempt, signal])
 
-    return cleanup
-  }, [sessionId, cwdHint, attempt])
+  const { state, info } = snapshot
+  const shownPath = state === 'error' && info?.message
+    ? info.message
+    : (info?.cwd || snapshot.boundCwd || cwdHint || '')
 
   return (
     <div className="dsh-term-panel">
-      <div className="dsh-term-view" ref={hostRef} />
+      <div className="dsh-term-slot" ref={slotRef} />
       <div className="dsh-term-status">
         <span className="dsh-term-badge" data-state={state}>{STATE_LABEL[state] ?? state}</span>
-        <span className="dsh-term-status-path" title={info?.message || info?.cwd || cwdHint || ''}>
-          {state === 'error' && info?.message ? info.message : (info?.cwd ?? cwdHint ?? '')}
+        <span className="dsh-term-status-path" title={info?.message || shownPath}>
+          {shownPath}
         </span>
         {state === 'exit' || state === 'error' ? (
-          <button type="button" className="dsh-term-restart" onClick={() => setAttempt((n) => n + 1)}>
+          <button
+            type="button"
+            className="dsh-term-restart"
+            onClick={() => {
+              if (pinned) pinnedTerminals.restart(createPinned)
+              else setAttempt((n) => n + 1)
+            }}
+          >
             重开终端
           </button>
         ) : null}
@@ -616,15 +494,18 @@ function TerminalTitle(props) {
 }
 
 // ---------------------------------------------------------------------------
-// Bottom dock placement (conversation.composer.dock, session scope)
+// Bottom dock placement (conversation.composer.dock, session scope).
+// The slot unmounts on session switch; TerminalView pinned keeps the shell.
 // ---------------------------------------------------------------------------
 
 function TerminalDock(props, ctx) {
   const { sessionId, useSessions } = props
   const dock = useDock()
+  const pinned = usePinnedSnapshot()
   const cwdHint = typeof useSessions === 'function'
     ? useSessions((sessions) => sessions.byId?.[sessionId]?.cwd)
     : undefined
+  const shownCwd = pinned.info?.cwd || pinned.boundCwd || cwdHint || ''
 
   const onDragStart = React.useCallback((event) => {
     event.preventDefault()
@@ -651,7 +532,7 @@ function TerminalDock(props, ctx) {
       <div className="dsh-term-dock-head">
         <SquareTerminalGlyph size={14} />
         <span className="dsh-term-dock-head-title">终端</span>
-        <span className="dsh-term-dock-head-cwd" title={cwdHint ?? ''}>{cwdHint ?? ''}</span>
+        <span className="dsh-term-dock-head-cwd" title={shownCwd}>{shownCwd}</span>
         <button
           type="button"
           className="dsh-term-iconbtn"
@@ -663,7 +544,7 @@ function TerminalDock(props, ctx) {
         </button>
       </div>
       <div className="dsh-term-dock-body" style={{ height: dock.height ?? 260 }}>
-        <TerminalView ctx={ctx} sessionId={sessionId} cwdHint={cwdHint} />
+        <TerminalView ctx={ctx} sessionId={sessionId} cwdHint={cwdHint} pinned />
       </div>
     </div>
   )
@@ -803,6 +684,11 @@ export function apply(ctx) {
   sidebarRightService = ctx.sidebarRight
 
   ctx.effect(() => installOpenEvents())
+  // Drop the pinned PTY when this client bundle is torn down. Session
+  // switches only detach it; they must not reach this disposer.
+  ctx.effect(() => () => {
+    pinnedTerminals.dispose()
+  })
 
   ctx.effect(() => ctx.sidebarRightTabs.register({
     id: TAB_ID,

@@ -6139,8 +6139,6 @@ __export(client_exports, {
 });
 module.exports = __toCommonJS(client_exports);
 var import_react = __toESM(require("react"), 1);
-var import_xterm = __toESM(require_xterm(), 1);
-var import_addon_fit = __toESM(require_addon_fit(), 1);
 var import_dsh_client_store = require("@deepseek-ai/dsh-client-store");
 var primitives = __toESM(require("@deepseek-ai/dsh-client-ui-primitives"), 1);
 
@@ -6365,6 +6363,335 @@ var xterm_default = `/**
 }
 `;
 
+// src/pinned-terminal.js
+function createPinnedRegistry() {
+  let current = null;
+  let generation = 0;
+  const listeners = /* @__PURE__ */ new Set();
+  function emit() {
+    for (const listener of listeners) listener();
+  }
+  function live() {
+    return current && current.disposed !== true ? current : null;
+  }
+  return {
+    get generation() {
+      return generation;
+    },
+    get current() {
+      return live();
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    /** Snapshot changed; generation did not. */
+    notify() {
+      emit();
+    },
+    acquire(factory) {
+      const existing = live();
+      if (existing) return existing;
+      current = factory();
+      emit();
+      return current;
+    },
+    restart(factory) {
+      const previous = current;
+      generation += 1;
+      current = factory();
+      previous?.dispose?.();
+      emit();
+      return current;
+    },
+    dispose() {
+      const previous = current;
+      current = null;
+      generation += 1;
+      previous?.dispose?.();
+      emit();
+    }
+  };
+}
+
+// src/terminal-session.js
+var import_xterm = __toESM(require_xterm(), 1);
+var import_addon_fit = __toESM(require_addon_fit(), 1);
+var parkEl = null;
+function terminalPark() {
+  if (parkEl?.isConnected) return parkEl;
+  parkEl = document.createElement("div");
+  parkEl.setAttribute("data-dsh-terminal-park", "");
+  parkEl.style.cssText = "position:fixed;left:0;top:0;width:0;height:0;overflow:hidden;pointer-events:none";
+  document.body.appendChild(parkEl);
+  return parkEl;
+}
+function createTerminalController(env, { ctx, sessionId, cwdHint, onSnapshot }) {
+  const { wsUrl: wsUrl2, readTheme: readTheme2, terminalFontFamily: terminalFontFamily2, minCols, minRows } = env;
+  const viewEl = document.createElement("div");
+  viewEl.className = "dsh-term-view";
+  let disposed = false;
+  let attached = false;
+  let opened = false;
+  let didFocus = false;
+  let open = false;
+  let ws = null;
+  const pending = [];
+  const listeners = /* @__PURE__ */ new Set();
+  let snapshot = { state: "connecting", info: null, boundCwd: cwdHint || "" };
+  const term = new import_xterm.Terminal({
+    cursorBlink: true,
+    cursorStyle: "bar",
+    fontSize: 13,
+    fontFamily: terminalFontFamily2(),
+    scrollback: 1e4,
+    theme: readTheme2()
+  });
+  const fit = new import_addon_fit.FitAddon();
+  term.loadAddon(fit);
+  function publish(patch) {
+    if (disposed) return;
+    snapshot = { ...snapshot, ...patch };
+    for (const listener of listeners) listener(snapshot);
+    onSnapshot?.(snapshot);
+  }
+  function publishState(updater) {
+    const next = updater(snapshot.state);
+    if (next !== snapshot.state) publish({ state: next });
+  }
+  function publishInfo(updater) {
+    publish({ info: updater(snapshot.info) });
+  }
+  const writeClipboard = (text) => {
+    if (!text) return;
+    const clipboard = navigator.clipboard;
+    if (clipboard?.writeText) {
+      clipboard.writeText(text).catch(() => {
+      });
+      return;
+    }
+    try {
+      document.execCommand("copy");
+    } catch {
+    }
+  };
+  const readClipboard = () => {
+    const clipboard = navigator.clipboard;
+    if (!clipboard?.readText) return Promise.resolve("");
+    return clipboard.readText().catch(() => "");
+  };
+  term.attachCustomKeyEventHandler((event) => {
+    const chord = event.ctrlKey || event.metaKey;
+    if (event.type === "keydown" && chord && event.shiftKey && event.code === "KeyC") {
+      writeClipboard(term.getSelection());
+      return false;
+    }
+    if (event.type === "keydown" && chord && event.shiftKey && event.code === "KeyV") {
+      event.preventDefault();
+      readClipboard().then((text) => {
+        if (text) term.paste(text);
+      });
+      return false;
+    }
+    return true;
+  });
+  const onCopy = (event) => {
+    const text = term.getSelection();
+    if (!text) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.clipboardData?.setData("text/plain", text);
+  };
+  const onPaste = (event) => {
+    const text = event.clipboardData?.getData("text/plain");
+    if (!text) return;
+    event.preventDefault();
+    event.stopPropagation();
+    term.paste(text);
+  };
+  const onSelectCopy = (event) => {
+    if (event.button !== 0 || !term.hasSelection()) return;
+    writeClipboard(term.getSelection());
+  };
+  const onContextMenu = (event) => {
+    const selection = term.getSelection();
+    if (selection) {
+      writeClipboard(selection);
+      return;
+    }
+    event.preventDefault();
+    readClipboard().then((text) => {
+      if (text) term.paste(text);
+    });
+  };
+  viewEl.addEventListener("copy", onCopy, true);
+  viewEl.addEventListener("paste", onPaste, true);
+  viewEl.addEventListener("mouseup", onSelectCopy);
+  viewEl.addEventListener("contextmenu", onContextMenu);
+  const send = (message) => {
+    if (open && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+    else pending.push(message);
+  };
+  function safeFit() {
+    if (!attached || disposed) return;
+    if (viewEl.clientWidth <= 0 || viewEl.clientHeight <= 0) return;
+    try {
+      fit.fit();
+    } catch {
+    }
+  }
+  const connect = () => {
+    if (disposed || ws || !attached) return;
+    safeFit();
+    ws = new WebSocket(wsUrl2(sessionId, cwdHint, Math.max(minCols, term.cols), Math.max(minRows, term.rows)));
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      open = true;
+      for (const message of pending.splice(0)) ws.send(JSON.stringify(message));
+    };
+    ws.onmessage = (event) => {
+      if (disposed) return;
+      if (typeof event.data === "string") {
+        let control;
+        try {
+          control = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        if (control?.type === "ready") {
+          publish({
+            state: "ready",
+            info: { cwd: control.cwd, shell: control.shell, pid: control.pid }
+          });
+        } else if (control?.type === "exit") {
+          publish({ state: "exit" });
+          publishInfo((prev) => ({ ...prev, exitCode: control.exitCode }));
+          term.write(`\r
+\x1B[2m[\u8FDB\u7A0B\u5DF2\u9000\u51FA\uFF0C\u9000\u51FA\u7801 ${String(control.exitCode ?? "?")}]\x1B[0m\r
+`);
+        } else if (control?.type === "error") {
+          publish({
+            state: "error",
+            info: { message: control.message }
+          });
+          term.write(`\r
+\x1B[31m${control.message}\x1B[0m\r
+`);
+        }
+        return;
+      }
+      term.write(new Uint8Array(event.data));
+    };
+    ws.onclose = (event) => {
+      if (disposed) return;
+      publishState((prev) => {
+        if (prev === "ready") return "exit";
+        if (prev === "connecting") return "error";
+        return prev;
+      });
+      if (event && event.code !== 1e3) {
+        const detail = `WebSocket \u5DF2\u5173\u95ED\uFF08code ${event.code}${event.reason ? `\uFF1A${event.reason}` : ""}\uFF09`;
+        publishInfo((prev) => prev?.message ? prev : { ...prev, message: detail });
+      }
+    };
+    ws.onerror = () => {
+      if (disposed) return;
+      publishState((prev) => prev === "connecting" ? "error" : prev);
+      publishInfo((prev) => prev?.message ? prev : { message: "WebSocket \u8FDE\u63A5\u5931\u8D25" });
+    };
+  };
+  const dataSub = term.onData((data) => send({ type: "input", data }));
+  const resizeSub = term.onResize(({ cols, rows }) => send({
+    type: "resize",
+    cols: Math.max(minCols, cols),
+    rows: Math.max(minRows, rows)
+  }));
+  const observer = new ResizeObserver(() => {
+    if (!attached || disposed) return;
+    if (!ws && viewEl.clientWidth > 0 && viewEl.clientHeight > 0) connect();
+    safeFit();
+  });
+  const applyTheme = () => {
+    term.options.theme = readTheme2();
+    term.options.fontFamily = terminalFontFamily2();
+  };
+  const themeObserver = new MutationObserver(applyTheme);
+  themeObserver.observe(document.body, { attributes: true, attributeFilter: ["data-ds-dark-theme"] });
+  const offTheme = typeof ctx.on === "function" ? ctx.on("theme/change", applyTheme) : void 0;
+  function attach(container) {
+    if (disposed) return;
+    container.appendChild(viewEl);
+    attached = true;
+    if (!opened) {
+      term.open(viewEl);
+      opened = true;
+    }
+    observer.observe(viewEl);
+    safeFit();
+    try {
+      term.refresh(0, Math.max(0, term.rows - 1));
+    } catch {
+    }
+    if (!ws && viewEl.clientWidth > 0 && viewEl.clientHeight > 0) connect();
+    if (!didFocus) {
+      didFocus = true;
+      term.focus();
+    }
+  }
+  function detach() {
+    if (disposed || !attached) return;
+    attached = false;
+    observer.disconnect();
+    terminalPark().appendChild(viewEl);
+  }
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    attached = false;
+    observer.disconnect();
+    themeObserver.disconnect();
+    if (typeof offTheme === "function") offTheme();
+    dataSub.dispose();
+    resizeSub.dispose();
+    viewEl.removeEventListener("copy", onCopy, true);
+    viewEl.removeEventListener("paste", onPaste, true);
+    viewEl.removeEventListener("mouseup", onSelectCopy);
+    viewEl.removeEventListener("contextmenu", onContextMenu);
+    if (ws) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      try {
+        ws.close();
+      } catch {
+      }
+      ws = null;
+    }
+    try {
+      term.dispose();
+    } catch {
+    }
+    viewEl.remove();
+    listeners.clear();
+  }
+  return {
+    get disposed() {
+      return disposed;
+    },
+    getSnapshot() {
+      return snapshot;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    attach,
+    detach,
+    dispose
+  };
+}
+
 // src/client.jsx
 var { Menu } = primitives;
 var IconChevronDownOutline142 = primitives.IconChevronDownOutline14 ?? primitives.IconChevronDownOutlineRegular ?? primitives.IconChevronDownOutlineMedium;
@@ -6385,6 +6712,7 @@ var MIN_ROWS = 5;
 var CSS = [
   xterm_default,
   ".dsh-term-panel{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}",
+  ".dsh-term-slot{flex:1;min-height:0;display:flex;flex-direction:column}",
   ".dsh-term-view{flex:1;min-height:0;padding:6px 4px 4px 10px;overflow:hidden}",
   ".dsh-term-view .xterm{height:100%}",
   ".dsh-term-status{display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.2));font-size:11px;color:var(--dsw-alias-label-tertiary,#999);white-space:nowrap;overflow:hidden}",
@@ -6582,211 +6910,89 @@ function useDock() {
     () => dockStore.getSnapshot()
   );
 }
-function TerminalView({ ctx, sessionId, cwdHint, signal }) {
-  const hostRef = import_react.default.useRef(null);
+var PINNED_EMPTY = Object.freeze({ state: "connecting", info: null, boundCwd: "" });
+var pinnedTerminals = createPinnedRegistry();
+function terminalEnv() {
+  return {
+    wsUrl,
+    readTheme,
+    terminalFontFamily,
+    minCols: MIN_COLS,
+    minRows: MIN_ROWS
+  };
+}
+function usePinnedGeneration() {
+  return import_react.default.useSyncExternalStore(
+    (callback) => pinnedTerminals.subscribe(callback),
+    () => pinnedTerminals.generation
+  );
+}
+function usePinnedSnapshot() {
+  return import_react.default.useSyncExternalStore(
+    (callback) => pinnedTerminals.subscribe(callback),
+    () => pinnedTerminals.current?.getSnapshot() ?? PINNED_EMPTY
+  );
+}
+function TerminalView({ ctx, sessionId, cwdHint, signal, pinned = false }) {
+  const slotRef = import_react.default.useRef(null);
   const [attempt, setAttempt] = import_react.default.useState(0);
-  const [state, setState] = import_react.default.useState("connecting");
-  const [info, setInfo] = import_react.default.useState(null);
-  import_react.default.useEffect(() => {
-    const el = hostRef.current;
-    if (!el || !sessionId) return void 0;
-    const term = new import_xterm.Terminal({
-      cursorBlink: true,
-      cursorStyle: "bar",
-      fontSize: 13,
-      fontFamily: terminalFontFamily(),
-      scrollback: 1e4,
-      theme: readTheme()
+  const generation = usePinnedGeneration();
+  const hints = import_react.default.useRef({ ctx, sessionId, cwdHint });
+  hints.current = { ctx, sessionId, cwdHint };
+  const [snapshot, setSnapshot] = import_react.default.useState(() => pinned ? pinnedTerminals.current?.getSnapshot() ?? { state: "connecting", info: null, boundCwd: cwdHint || "" } : { state: "connecting", info: null, boundCwd: cwdHint || "" });
+  const createPinned = import_react.default.useCallback(() => {
+    const hint = hints.current;
+    return createTerminalController(terminalEnv(), {
+      ctx: hint.ctx,
+      sessionId: hint.sessionId,
+      cwdHint: hint.cwdHint,
+      onSnapshot: () => pinnedTerminals.notify()
     });
-    const fit = new import_addon_fit.FitAddon();
-    term.loadAddon(fit);
-    term.open(el);
-    try {
-      fit.fit();
-    } catch {
-    }
-    term.focus();
-    const writeClipboard = (text) => {
-      if (!text) return;
-      const clipboard = navigator.clipboard;
-      if (clipboard?.writeText) {
-        clipboard.writeText(text).catch(() => {
-        });
-        return;
-      }
-      try {
-        document.execCommand("copy");
-      } catch {
-      }
+  }, []);
+  import_react.default.useLayoutEffect(() => {
+    if (!pinned) return void 0;
+    const slot = slotRef.current;
+    if (!slot) return void 0;
+    if (!hints.current.sessionId && !pinnedTerminals.current) return void 0;
+    const controller = pinnedTerminals.acquire(createPinned);
+    setSnapshot(controller.getSnapshot());
+    const off = controller.subscribe(setSnapshot);
+    controller.attach(slot);
+    return () => {
+      off();
+      controller.detach();
     };
-    const readClipboard = () => {
-      const clipboard = navigator.clipboard;
-      if (!clipboard?.readText) return Promise.resolve("");
-      return clipboard.readText().catch(() => "");
-    };
-    term.attachCustomKeyEventHandler((event) => {
-      const chord = event.ctrlKey || event.metaKey;
-      if (event.type === "keydown" && chord && event.shiftKey && event.code === "KeyC") {
-        writeClipboard(term.getSelection());
-        return false;
-      }
-      if (event.type === "keydown" && chord && event.shiftKey && event.code === "KeyV") {
-        event.preventDefault();
-        readClipboard().then((text) => {
-          if (text) term.paste(text);
-        });
-        return false;
-      }
-      return true;
-    });
-    const onCopy = (event) => {
-      const text = term.getSelection();
-      if (!text) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.clipboardData?.setData("text/plain", text);
-    };
-    const onPaste = (event) => {
-      const text = event.clipboardData?.getData("text/plain");
-      if (!text) return;
-      event.preventDefault();
-      event.stopPropagation();
-      term.paste(text);
-    };
-    const onSelectCopy = (event) => {
-      if (event.button !== 0 || !term.hasSelection()) return;
-      writeClipboard(term.getSelection());
-    };
-    const onContextMenu = (event) => {
-      const selection = term.getSelection();
-      if (selection) {
-        writeClipboard(selection);
-        return;
-      }
-      event.preventDefault();
-      readClipboard().then((text) => {
-        if (text) term.paste(text);
-      });
-    };
-    el.addEventListener("copy", onCopy, true);
-    el.addEventListener("paste", onPaste, true);
-    el.addEventListener("mouseup", onSelectCopy);
-    el.addEventListener("contextmenu", onContextMenu);
-    let disposed = false;
-    let open = false;
-    let ws = null;
-    const pending = [];
-    const send = (message) => {
-      if (open && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
-      else pending.push(message);
-    };
-    const connect = () => {
-      if (disposed || ws) return;
-      try {
-        fit.fit();
-      } catch {
-      }
-      ws = new WebSocket(wsUrl(sessionId, cwdHint, Math.max(MIN_COLS, term.cols), Math.max(MIN_ROWS, term.rows)));
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => {
-        open = true;
-        for (const message of pending.splice(0)) ws.send(JSON.stringify(message));
-      };
-      ws.onmessage = (event) => {
-        if (disposed) return;
-        if (typeof event.data === "string") {
-          let control;
-          try {
-            control = JSON.parse(event.data);
-          } catch {
-            return;
-          }
-          if (control?.type === "ready") {
-            setState("ready");
-            setInfo({ cwd: control.cwd, shell: control.shell, pid: control.pid });
-          } else if (control?.type === "exit") {
-            setState("exit");
-            setInfo((prev) => ({ ...prev, exitCode: control.exitCode }));
-            term.write(`\r
-\x1B[2m[\u8FDB\u7A0B\u5DF2\u9000\u51FA\uFF0C\u9000\u51FA\u7801 ${String(control.exitCode ?? "?")}]\x1B[0m\r
-`);
-          } else if (control?.type === "error") {
-            setState("error");
-            setInfo({ message: control.message });
-            term.write(`\r
-\x1B[31m${control.message}\x1B[0m\r
-`);
-          }
-          return;
-        }
-        term.write(new Uint8Array(event.data));
-      };
-      ws.onclose = (event) => {
-        if (disposed) return;
-        setState((prev) => {
-          if (prev === "ready") return "exit";
-          if (prev === "connecting") return "error";
-          return prev;
-        });
-        if (event && event.code !== 1e3) {
-          const detail = `WebSocket \u5DF2\u5173\u95ED\uFF08code ${event.code}${event.reason ? `\uFF1A${event.reason}` : ""}\uFF09`;
-          setInfo((prev) => prev?.message ? prev : { ...prev, message: detail });
-        }
-      };
-      ws.onerror = () => {
-        if (disposed) return;
-        setState((prev) => prev === "connecting" ? "error" : prev);
-        setInfo((prev) => prev?.message ? prev : { message: "WebSocket \u8FDE\u63A5\u5931\u8D25" });
-      };
-    };
-    const dataSub = term.onData((data) => send({ type: "input", data }));
-    const resizeSub = term.onResize(({ cols, rows }) => send({
-      type: "resize",
-      cols: Math.max(MIN_COLS, cols),
-      rows: Math.max(MIN_ROWS, rows)
-    }));
-    const observer = new ResizeObserver(() => {
-      if (!ws && el.clientWidth > 0 && el.clientHeight > 0) connect();
-      try {
-        fit.fit();
-      } catch {
-      }
-    });
-    observer.observe(el);
-    if (el.clientWidth > 0 && el.clientHeight > 0) connect();
-    const applyTheme = () => {
-      term.options.theme = readTheme();
-      term.options.fontFamily = terminalFontFamily();
-    };
-    const themeObserver = new MutationObserver(applyTheme);
-    themeObserver.observe(document.body, { attributes: true, attributeFilter: ["data-ds-dark-theme"] });
-    const offTheme = typeof ctx.on === "function" ? ctx.on("theme/change", applyTheme) : void 0;
-    const onAbort = () => cleanup();
+  }, [pinned, generation, sessionId, createPinned]);
+  import_react.default.useLayoutEffect(() => {
+    if (pinned) return void 0;
+    const slot = slotRef.current;
+    if (!slot || !sessionId) return void 0;
+    const controller = createTerminalController(terminalEnv(), { ctx, sessionId, cwdHint });
+    setSnapshot(controller.getSnapshot());
+    const off = controller.subscribe(setSnapshot);
+    controller.attach(slot);
+    const onAbort = () => controller.dispose();
     signal?.addEventListener("abort", onAbort, { once: true });
-    function cleanup() {
-      if (disposed) return;
-      disposed = true;
+    return () => {
+      off();
       signal?.removeEventListener("abort", onAbort);
-      themeObserver.disconnect();
-      observer.disconnect();
-      if (typeof offTheme === "function") offTheme();
-      dataSub.dispose();
-      resizeSub.dispose();
-      el.removeEventListener("copy", onCopy, true);
-      el.removeEventListener("paste", onPaste, true);
-      el.removeEventListener("mouseup", onSelectCopy);
-      el.removeEventListener("contextmenu", onContextMenu);
-      if (ws) {
-        try {
-          ws.close();
-        } catch {
-        }
+      controller.dispose();
+    };
+  }, [pinned, sessionId, cwdHint, attempt, signal]);
+  const { state, info } = snapshot;
+  const shownPath = state === "error" && info?.message ? info.message : info?.cwd || snapshot.boundCwd || cwdHint || "";
+  return /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-panel" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-slot", ref: slotRef }), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-status" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-badge", "data-state": state }, STATE_LABEL[state] ?? state), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-status-path", title: info?.message || shownPath }, shownPath), state === "exit" || state === "error" ? /* @__PURE__ */ import_react.default.createElement(
+    "button",
+    {
+      type: "button",
+      className: "dsh-term-restart",
+      onClick: () => {
+        if (pinned) pinnedTerminals.restart(createPinned);
+        else setAttempt((n) => n + 1);
       }
-      term.dispose();
-    }
-    return cleanup;
-  }, [sessionId, cwdHint, attempt]);
-  return /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-panel" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-view", ref: hostRef }), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-status" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-badge", "data-state": state }, STATE_LABEL[state] ?? state), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-status-path", title: info?.message || info?.cwd || cwdHint || "" }, state === "error" && info?.message ? info.message : info?.cwd ?? cwdHint ?? ""), state === "exit" || state === "error" ? /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-term-restart", onClick: () => setAttempt((n) => n + 1) }, "\u91CD\u5F00\u7EC8\u7AEF") : null));
+    },
+    "\u91CD\u5F00\u7EC8\u7AEF"
+  ) : null));
 }
 function TerminalBody(props, ctx) {
   const { sessionId, useSessions } = props;
@@ -6802,7 +7008,9 @@ function TerminalTitle(props) {
 function TerminalDock(props, ctx) {
   const { sessionId, useSessions } = props;
   const dock = useDock();
+  const pinned = usePinnedSnapshot();
   const cwdHint = typeof useSessions === "function" ? useSessions((sessions) => sessions.byId?.[sessionId]?.cwd) : void 0;
+  const shownCwd = pinned.info?.cwd || pinned.boundCwd || cwdHint || "";
   const onDragStart = import_react.default.useCallback((event) => {
     event.preventDefault();
     const startY = event.clientY;
@@ -6820,7 +7028,7 @@ function TerminalDock(props, ctx) {
     window.addEventListener("pointerup", onUp);
   }, []);
   if (!dock?.open) return null;
-  return /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock-drag", onPointerDown: onDragStart }), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock-head" }, /* @__PURE__ */ import_react.default.createElement(SquareTerminalGlyph, { size: 14 }), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-dock-head-title" }, "\u7EC8\u7AEF"), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-dock-head-cwd", title: cwdHint ?? "" }, cwdHint ?? ""), /* @__PURE__ */ import_react.default.createElement(
+  return /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock-drag", onPointerDown: onDragStart }), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock-head" }, /* @__PURE__ */ import_react.default.createElement(SquareTerminalGlyph, { size: 14 }), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-dock-head-title" }, "\u7EC8\u7AEF"), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-dock-head-cwd", title: shownCwd }, shownCwd), /* @__PURE__ */ import_react.default.createElement(
     "button",
     {
       type: "button",
@@ -6830,7 +7038,7 @@ function TerminalDock(props, ctx) {
       onClick: () => closeDock()
     },
     /* @__PURE__ */ import_react.default.createElement(CloseGlyph, null)
-  )), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock-body", style: { height: dock.height ?? 260 } }, /* @__PURE__ */ import_react.default.createElement(TerminalView, { ctx, sessionId, cwdHint })));
+  )), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-dock-body", style: { height: dock.height ?? 260 } }, /* @__PURE__ */ import_react.default.createElement(TerminalView, { ctx, sessionId, cwdHint, pinned: true })));
 }
 function TerminalPositionSettingRow() {
   const position = usePosition();
@@ -6918,6 +7126,9 @@ function apply(ctx) {
   positionStore = bindPositionStore(ctx);
   sidebarRightService = ctx.sidebarRight;
   ctx.effect(() => installOpenEvents());
+  ctx.effect(() => () => {
+    pinnedTerminals.dispose();
+  });
   ctx.effect(() => ctx.sidebarRightTabs.register({
     id: TAB_ID,
     kind: TAB_KIND,
