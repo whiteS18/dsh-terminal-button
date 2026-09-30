@@ -400,6 +400,12 @@ function TerminalView({ ctx, sessionId, cwdHint, signal }) {
         return false
       }
       if (event.type === 'keydown' && chord && event.shiftKey && event.code === 'KeyV') {
+        // Chromium dispatches a native "paste as plain text" paste event for
+        // Ctrl+Shift+V in a textarea, and xterm does NOT preventDefault when
+        // this handler returns false — so without this guard the clipboard
+        // lands twice: once through the native paste event (onPaste below)
+        // and once through this async clipboard read.
+        event.preventDefault()
         readClipboard().then((text) => { if (text) term.paste(text) })
         return false
       }

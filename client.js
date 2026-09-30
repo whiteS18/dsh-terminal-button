@@ -6631,6 +6631,7 @@ function TerminalView({ ctx, sessionId, cwdHint, signal }) {
         return false;
       }
       if (event.type === "keydown" && chord && event.shiftKey && event.code === "KeyV") {
+        event.preventDefault();
         readClipboard().then((text) => {
           if (text) term.paste(text);
         });
