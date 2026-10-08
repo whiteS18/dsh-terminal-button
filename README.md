@@ -29,7 +29,7 @@ dsh plugin --profile desktop add dsh-terminal-button
 本地开发版：
 
 ```sh
-dsh plugin --profile desktop add C:/Users/scw/project/exp/dsh-plugin/dsh-terminal-button
+dsh plugin --profile desktop add /绝对路径/dsh-terminal-button
 ```
 
 > [!IMPORTANT]
