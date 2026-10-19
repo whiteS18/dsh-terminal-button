@@ -16,7 +16,7 @@
  */
 import React from 'react'
 import { loadOfficialTerminalBody } from './official-terminal.js'
-import { statusOf, translate } from './terminal-status.js'
+import { isRestoredMissingTerminal, statusOf, translate } from './terminal-status.js'
 
 /** View key and content identity: one bottom terminal per Session. */
 const VIEW_KEY = 'dsh-terminal-bottom'
@@ -42,6 +42,12 @@ export function BottomTerminal({ ctx, sessionId, retention }) {
   const [error, setError] = React.useState('')
   const [view, setView] = React.useState(null)
   const [generation, setGeneration] = React.useState(0)
+  /** One-shot explanation shown in the status row after a silent self-heal. */
+  const [notice, setNotice] = React.useState('')
+  /** At most one automatic rebuild until a terminal actually reaches running. */
+  const autoRetryArmed = React.useRef(true)
+  /** The view that already consumed the automatic rebuild. */
+  const autoRetriedView = React.useRef(null)
 
   const service = React.useMemo(
     () => (typeof ctx.get === 'function' ? ctx.get('webTerminals') : undefined),
@@ -90,6 +96,7 @@ export function BottomTerminal({ ctx, sessionId, retention }) {
         service.close(sessionId, VIEW_KEY, CONTENT_ID, view.id)
       } catch { /* the fresh view reports any remaining problem */ }
     }
+    setNotice('')
     setView(null)
     setGeneration((value) => value + 1)
   }, [service, sessionId, view])
@@ -144,7 +151,32 @@ export function BottomTerminal({ ctx, sessionId, retention }) {
   )
   const state = React.useSyncExternalStore(subscribeState, readState)
   const status = statusOf(state)
-  const shownPath = status.message ?? state.info?.cwd ?? state.environment?.cwd ?? ''
+  const shownPath = notice !== ''
+    ? notice
+    : (status.message ?? state.info?.cwd ?? state.environment?.cwd ?? '')
+
+  // Self-heal a stale restored terminal: the Host process is gone (DSH
+  // restart, session unload, idle reclamation) but a fresh one can be created.
+  // Only a restore attempt qualifies — a failed *creation* would fail again.
+  // One attempt is armed until a terminal actually reaches running, so a Host
+  // that cannot create terminals never produces a rebuild loop.
+  React.useEffect(() => {
+    if (view === null || !autoRetryArmed.current) return
+    if (autoRetriedView.current === view) return
+    if (!isRestoredMissingTerminal(state, view)) return
+    autoRetriedView.current = view
+    autoRetryArmed.current = false
+    restart()
+    setNotice('原终端已不存在，已自动新建终端')
+  }, [state?.issue, view, restart])
+
+  // Re-arm the automatic rebuild once a terminal is genuinely healthy, and
+  // retire the one-shot notice.
+  React.useEffect(() => {
+    if (state?.phase !== 'connected' || state?.info?.state !== 'running') return
+    autoRetryArmed.current = true
+    setNotice('')
+  }, [state?.phase, state?.info?.state])
 
   if (error !== '') {
     return <div className="dsh-term-message" role="alert">{error}</div>

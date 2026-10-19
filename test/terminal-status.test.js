@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { statusOf, translate } from '../src/terminal-status.js'
+import { isRestoredMissingTerminal, statusOf, translate } from '../src/terminal-status.js'
 
 test('missingTerminal shows the friendly copy instead of the raw issue token', () => {
   // `terminal/view` failures carry the issue token as their message; the status
@@ -40,4 +40,28 @@ test('the copy table interpolates official placeholders', () => {
   assert.equal(translate('failed', { message: 'boom' }), '终端错误：boom')
   assert.equal(translate('missingTerminal'), '此终端已不存在，请新建终端。')
   assert.equal(translate('unknownKey'), 'unknownKey')
+})
+
+test('a stale restored terminal is auto-recreated', () => {
+  assert.equal(
+    isRestoredMissingTerminal({ issue: 'missingTerminal' }, { createWhenMissing: false }),
+    true,
+  )
+})
+
+test('a failed brand-new creation is not auto-retried', () => {
+  assert.equal(
+    isRestoredMissingTerminal({ issue: 'missingTerminal' }, { createWhenMissing: true }),
+    false,
+  )
+})
+
+test('other issues or no view never trigger the rebuild', () => {
+  assert.equal(isRestoredMissingTerminal({ issue: 'terminalLimit' }, { createWhenMissing: false }), false)
+  assert.equal(isRestoredMissingTerminal({ issue: 'missingTerminal' }, null), false)
+  assert.equal(isRestoredMissingTerminal(undefined, { createWhenMissing: false }), false)
+})
+
+test('a runtime without the official marker defaults to the restore case', () => {
+  assert.equal(isRestoredMissingTerminal({ issue: 'missingTerminal' }, {}), true)
 })

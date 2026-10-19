@@ -55,6 +55,32 @@ export function translate(key, params) {
 }
 
 /**
+ * Whether a missing terminal came from a *restore* attempt and can therefore
+ * be healed by creating a fresh terminal.
+ *
+ * A `terminal/unavailable` failure is `missingTerminal` in two cases:
+ *  - a restored view (saved Host id) whose process is gone — the safe case:
+ *    allocate a new terminal instead of asking the user to click;
+ *  - a brand-new view whose creation failed (Host/session unavailable) — a
+ *    retry would only fail again, so leave the explicit UI in charge.
+ *
+ * The official view marks the difference with `createWhenMissing`: false means
+ * the view was built from a saved binding and may never allocate by itself.
+ * Runtimes without that field default to the restore case, paired with the
+ * component's one-retry-until-healthy guard.
+ *
+ * @param {any} state - official `webTerminals` view snapshot.
+ * @param {any} view - official view that produced the snapshot.
+ * @returns {boolean} true when the panel should recreate the terminal.
+ */
+export function isRestoredMissingTerminal(state, view) {
+  if (state?.issue !== 'missingTerminal') return false
+  if (view === null || typeof view !== 'object') return false
+  if (typeof view.createWhenMissing === 'boolean') return view.createWhenMissing === false
+  return true
+}
+
+/**
  * Reduce one official view snapshot to the bottom status bar's badge/actions.
  *
  * A `terminal/view` failure stores the issue token as its message

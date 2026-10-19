@@ -4,7 +4,7 @@ DeepSeek Harness 插件：**官方终端（`@deepseek-ai/dsh-client-ui-sidebar-t
 
 DSH 0.2.1 起官方已内置右侧栏终端（PTY、传输、会话清单、主题、xterm 全部由官方实现）。从 **0.4.0** 起本插件不再重复实现终端，也不再注册自己的侧栏 Tab，而是把官方终端渲染到会话列底部，并补上官方没提供的桌面入口与命令 shim：
 
-- **底部面板**：在 `conversation.composer.dock` 渲染官方 `TerminalBody`（从官方包的懒加载 chunk `lib/client.terminal.js` 取用），数据来自官方客户端服务 `webTerminals`。没有插件自己的 PTY、WebSocket、xterm 或会话恢复逻辑。面板外层布局与 0.3.x 一致：composer 底部行整行换行、独占一行、与主界面同宽，顶部可拖拽调高度，头部显示会话 cwd，**底部保留状态行**（连接中 / 运行中 / 已退出 / 错误 + 路径 + 「重开终端」）。
+- **底部面板**：在 `conversation.composer.dock` 渲染官方 `TerminalBody`（从官方包的懒加载 chunk `lib/client.terminal.js` 取用），数据来自官方客户端服务 `webTerminals`。没有插件自己的 PTY、WebSocket、xterm 或会话恢复逻辑。面板外层布局与 0.3.x 一致：composer 底部行整行换行、独占一行、与主界面同宽，顶部可拖拽调高度，头部显示会话 cwd，**底部保留状态行**（连接中 / 运行中 / 已退出 / 错误 + 路径 + 「重开终端」）。旧终端被 Host 回收/销毁后（重启、会话卸载、空闲回收），打开面板时会**自动新建**一个终端并在状态行提示，不需要手动点「新建终端」。
 - **桌面「打开终端」入口拦截**：托盘 / 设置页 / 标题栏的「打开终端」经 Host 端 patch `desktopRuntime.openTerminal` 重定向到底部面板（SSE `/dsh-terminal/events` 通知前端）；**系统弹窗**模式下放行原生行为，直接弹系统终端窗口。
 - **`dsh` 命令 shim**：桌面版没有独立的 `dsh` 可执行文件，官方终端启动子进程时只透传 `DSH_SESSION_ID`。插件 patch `ctx.subprocess.spawnTerminal`，把临时目录里的 `dsh.cmd` / `dsh` 前插到 PATH——**官方右侧栏终端与底部面板都生效**，且不会把任何 `DSH_*` 变量重新注入 shell。
 - **位置设置**：插件 → 插件列表 → 本插件详情里的「终端显示位置」，可选 **底部面板**（默认）或 **系统弹窗**；右侧栏终端由官方提供，旧配置里的 `sidebar` 会自动归一为底部面板。

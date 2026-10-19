@@ -147,6 +147,12 @@ function translate(key, params) {
   if (params === void 0 || params === null) return template;
   return template.replace(/\{(\w+)\}/g, (match, name2) => name2 in params ? String(params[name2]) : match);
 }
+function isRestoredMissingTerminal(state, view) {
+  if (state?.issue !== "missingTerminal") return false;
+  if (view === null || typeof view !== "object") return false;
+  if (typeof view.createWhenMissing === "boolean") return view.createWhenMissing === false;
+  return true;
+}
 function statusOf(state) {
   const phase = state?.phase;
   const info = state?.info;
@@ -175,6 +181,9 @@ function BottomTerminal({ ctx, sessionId, retention }) {
   const [error, setError] = import_react.default.useState("");
   const [view, setView] = import_react.default.useState(null);
   const [generation, setGeneration] = import_react.default.useState(0);
+  const [notice, setNotice] = import_react.default.useState("");
+  const autoRetryArmed = import_react.default.useRef(true);
+  const autoRetriedView = import_react.default.useRef(null);
   const service = import_react.default.useMemo(
     () => typeof ctx.get === "function" ? ctx.get("webTerminals") : void 0,
     [ctx]
@@ -215,6 +224,7 @@ function BottomTerminal({ ctx, sessionId, retention }) {
       } catch {
       }
     }
+    setNotice("");
     setView(null);
     setGeneration((value) => value + 1);
   }, [service, sessionId, view]);
@@ -261,7 +271,21 @@ function BottomTerminal({ ctx, sessionId, retention }) {
   );
   const state = import_react.default.useSyncExternalStore(subscribeState, readState);
   const status = statusOf(state);
-  const shownPath = status.message ?? state.info?.cwd ?? state.environment?.cwd ?? "";
+  const shownPath = notice !== "" ? notice : status.message ?? state.info?.cwd ?? state.environment?.cwd ?? "";
+  import_react.default.useEffect(() => {
+    if (view === null || !autoRetryArmed.current) return;
+    if (autoRetriedView.current === view) return;
+    if (!isRestoredMissingTerminal(state, view)) return;
+    autoRetriedView.current = view;
+    autoRetryArmed.current = false;
+    restart();
+    setNotice("\u539F\u7EC8\u7AEF\u5DF2\u4E0D\u5B58\u5728\uFF0C\u5DF2\u81EA\u52A8\u65B0\u5EFA\u7EC8\u7AEF");
+  }, [state?.issue, view, restart]);
+  import_react.default.useEffect(() => {
+    if (state?.phase !== "connected" || state?.info?.state !== "running") return;
+    autoRetryArmed.current = true;
+    setNotice("");
+  }, [state?.phase, state?.info?.state]);
   if (error !== "") {
     return /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-message", role: "alert" }, error);
   }

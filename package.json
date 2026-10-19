@@ -1,6 +1,6 @@
 {
   "name": "dsh-terminal-button",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Extension for DeepSeek Harness's official terminal: renders it in an in-app bottom panel, redirects Desktop \"open terminal\" entry points into that panel, and exposes the dsh CLI inside terminals. No second PTY/xterm stack.",
   "keywords": [
     "deepseek",
