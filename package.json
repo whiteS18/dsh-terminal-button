@@ -1,15 +1,15 @@
 {
   "name": "dsh-terminal-button",
-  "version": "0.3.9",
-  "description": "Embedded terminal for DeepSeek Harness: opens an in-app terminal panel in the right sidebar (DockKit) instead of spawning a system terminal window. Follows the DSH theme and starts in the session workspace root.",
+  "version": "0.4.0",
+  "description": "Extension for DeepSeek Harness's official terminal: renders it in an in-app bottom panel, redirects Desktop \"open terminal\" entry points into that panel, and exposes the dsh CLI inside terminals. No second PTY/xterm stack.",
   "keywords": [
     "deepseek",
     "deepseek-harness",
     "dsh",
     "plugin",
     "terminal",
-    "pty",
-    "xterm",
+    "bottom-panel",
+    "extension",
     "cordis"
   ],
   "type": "module",
@@ -25,7 +25,6 @@
   },
   "files": [
     "index.js",
-    "frames.js",
     "client.js",
     "cordis.patch.yml",
     "README.md"
@@ -37,7 +36,8 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-sidebar-right"
+        "@deepseek-ai/dsh-api-terminal-controller",
+        "@deepseek-ai/dsh-client-ui-sidebar-terminal"
       ]
     }
   },
@@ -56,8 +56,6 @@
     "registry": "https://registry.npmjs.org"
   },
   "devDependencies": {
-    "@xterm/addon-fit": "^0.10.0",
-    "@xterm/xterm": "^5.5.0",
     "esbuild": "^0.25.0"
   },
   "dependencies": {

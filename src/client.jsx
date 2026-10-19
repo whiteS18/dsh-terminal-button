@@ -1,56 +1,36 @@
 /**
  * dsh-terminal-button — Client half (browser bundle).
  *
- * Bundled by build.mjs (esbuild): @xterm/xterm + FitAddon + xterm.css are
- * inlined; only platform seed modules (react, @deepseek-ai/*) stay external
- * and resolve through the loader's `require`.
+ * An extension of DeepSeek Harness's official terminal
+ * (`@deepseek-ai/dsh-client-ui-sidebar-terminal`), not a second terminal.
+ * DSH 0.2.1 ships a right-sidebar terminal; this plugin no longer registers a
+ * competing sidebar tab and no longer runs its own xterm/WebSocket/PTY stack.
+ * What it adds:
  *
- * Placement is configurable (settingsScope namespace "dsh-terminal-button" on
- * DSH <= 0.1.5; the volatile `position` field of the `terminal-plugin` loader
- * entry via `configForms` on DSH >= 0.1.6 — key "position" either way):
- *   - "sidebar" (default): a DockKit right-sidebar tab (kind "terminal"),
- *     opened from the Desktop titlebar button or the sidebar guide.
- *   - "bottom": a full-width panel at the very bottom of the session column
- *     (`conversation.composer.dock`, wrapped onto its own line below the
- *     token meter via CSS). It rises from the bottom edge and pushes the
- *     composer (input card and context meter stay glued together) plus the
- *     conversation up, mirroring opencode's bottom panel. Drag the top edge
- *     to resize; the close button collapses the panel without killing the
- *     shell. The slot is session-scoped, so switching sessions unmounts the
- *     panel; the shell is not — the same xterm and PTY are parked and
- *     reattached instead of being spawned again.
- *   - "external": every entry point spawns the Desktop-native system
- *     terminal window instead (via the host's /dsh-terminal/open-native).
- * The selector itself is registered into the Plugins page detail of this
- * bundle (`plugins.bundle.config`, keyed by the package name). On DSH <= 0.1.5,
- * which has no Plugins detail slot, it stays on `settings.general.item`.
- * Either surface uses the native primitives Menu.
+ *   - "bottom" placement: the official terminal body rendered in
+ *     `conversation.composer.dock`, below the composer, with a resizable panel
+ *     and a persistent-per-Session view through the official `webTerminals`
+ *     service.
+ *   - Desktop entry-point redirection: the tray/settings/titlebar "open
+ *     terminal" affordance opens this bottom panel instead of a system window
+ *     (the Host half patches `desktopRuntime.openTerminal` and pushes an SSE
+ *     `open`; the "external" placement falls through to the system window).
+ *   - A settings row for that placement.
  *
- * On DSH Desktop, "open terminal" entry points split across two processes:
- * tray/settings-page calls reach the Host's `desktopRuntime` service (host
- * patch → SSE `/dsh-terminal/events`), while the titlebar chrome — a separate
- * WebContentsView — is handled by the Electron main process, which the
- * desktop installation patch (electron-runtime-*.js, chromeActions
- * .openTerminal) turns into a `dsh-desktop:open-terminal` window event.
- * This bundle listens to both and reveals the panel.
- *
- * The icon is Lucide's SquareTerminal — the same glyph DSH Desktop's native
- * titlebar terminal button ships — so the entry points look native.
- *
- * The xterm panel is wired to the host over a same-origin WebSocket
- * (`/dsh-terminal/pty`). Theme follows the DSH CSS tokens (--dsw-alias-*)
- * and re-reads on `theme/change` and body[data-ds-dark-theme] flips. The
- * PTY cwd is resolved host-side from the session id (workspace root); the
- * client only sends its session cwd as a fallback hint.
+ * The terminal itself — PTY, transport, session inventory, theme, xterm — is
+ * the official implementation. This half only supplies a bottom-panel
+ * occurrence: the official `TerminalBody` component is loaded from the
+ * official package's lazy chunk and wired to a `webTerminals` view, exactly as
+ * the sidebar does, plus the window-hold bridge that keeps that view alive
+ * without a sidebar tab.
  */
 import React from 'react'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
-import xtermCss from '@xterm/xterm/css/xterm.css'
-import { createPinnedRegistry } from './pinned-terminal.js'
-import { resolveLoopbackBase, webSocketUrl } from './loopback.js'
+import { createRetentionBridge } from './terminal-retention.js'
+import { BottomTerminal } from './terminal-panel.jsx'
+import { normalizePosition, POSITIONS } from './position.js'
 import { shouldCollapseDock } from './dock-visibility.js'
-import { createTerminalController } from './terminal-session.js'
 
 const { Menu } = primitives
 // Icon exports were renamed in DSH 0.1.7 (size suffix dropped for Regular/
@@ -60,17 +40,11 @@ const IconChevronDownOutline14 = primitives.IconChevronDownOutline14
   ?? primitives.IconChevronDownOutlineMedium
 
 export const name = 'dsh-terminal-button'
-// 'settingsScope' was removed in DSH 0.1.7 (replaced by 'configForms') and
-// 'theme' is only consumed through the ctx.on('theme/change') event — neither
-// may be a hard inject, or the client half never activates on 0.1.7.
-export const inject = ['slots', 'sidebarRightTabs', 'sidebarRight']
+// `webTerminals` is the official client terminal service; requiring it makes
+// this plugin an extension of that service instead of a parallel terminal.
+export const inject = ['slots', 'webTerminals']
 
-const TAB_ID = 'dsh-terminal'
-const TAB_KIND = 'terminal'
-const WS_PATH = '/dsh-terminal/pty'
-/** SSE channel: the host pushes 'open' when a Desktop entry point fires. */
 const EVENTS_PATH = '/dsh-terminal/events'
-/** Host endpoint that always spawns the Desktop system terminal window. */
 const OPEN_NATIVE_PATH = '/dsh-terminal/open-native'
 const SETTINGS_NAMESPACE = 'dsh-terminal-button'
 /**
@@ -81,55 +55,20 @@ const CONFIG_ENTRY_ID = 'terminal-plugin'
 /** Plugins page keys `plugins.bundle.config` by the package name. */
 const BUNDLE_KEY = 'dsh-terminal-button'
 const POSITION_KEY = 'position'
-const POSITIONS = { sidebar: '右侧栏', bottom: '底部面板', external: '系统弹窗' }
-/**
- * PSReadLine disables its ListView prediction — and prints a warning at every
- * prompt — when the console window is smaller than 50x5. A hidden or
- * freshly-mounted panel fits xterm to a degenerate 2x1, so the PTY geometry
- * is floored at this minimum (host enforces the same floor as backstop).
- */
-const MIN_COLS = 50
-const MIN_ROWS = 5
 
 const CSS = [
-  xtermCss,
-  '.dsh-term-panel{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}',
-  '.dsh-term-slot{flex:1;min-height:0;display:flex;flex-direction:column}',
-  '.dsh-term-view{flex:1;min-height:0;padding:6px 4px 4px 10px;overflow:hidden}',
-  '.dsh-term-view .xterm{height:100%}',
-  '.dsh-term-status{display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.2));font-size:11px;color:var(--dsw-alias-label-tertiary,#999);white-space:nowrap;overflow:hidden}',
-  '.dsh-term-status-path{overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left;flex:1}',
-  '.dsh-term-badge{flex:none;padding:1px 6px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12))}',
-  '.dsh-term-badge[data-state="exit"],.dsh-term-badge[data-state="error"]{color:var(--dsw-alias-state-error-primary,#f85149)}',
-  '.dsh-term-badge[data-state="ready"]{color:var(--dsw-alias-state-success-primary,#3fb950)}',
-  '.dsh-term-restart{flex:none;border:none;border-radius:6px;padding:2px 8px;cursor:pointer;background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12));color:var(--dsw-alias-label-secondary,#ccc);font-size:11px}',
-  '.dsh-term-restart:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.2))}',
-  '.dsh-term-title{display:inline-flex;align-items:center;gap:6px}',
-  '.dsh-term-title svg{width:14px;height:14px;display:block}',
-  // Bottom dock card (conversation.composer.dock). The slot outlet renders
-  // inside the composer's bottom flex row — a horizontal line it shares with
-  // the context (token) meter, which would squeeze the panel into the middle.
-  // The :has() rule below turns that row into a wrapping, full-width line so
-  // the dock (order: 1, basis > 100%) lands on its own row BELOW the meter,
-  // and the negative side margins cancel the composer root's side clearance
-  // so the panel spans the whole conversation column (main-area width) and
-  // rises from the bottom edge — opencode-style. The conversation column's
-  // width-drag handle (._widthHandle) is absolutely positioned over the
-  // content's right edge in a stacking context we cannot out-z-index from
-  // inside the slot — so keep the dock head's controls clear of that strip
-  // with right padding.
-  'div:has(> [data-slot="conversation.composer.dock"] > .dsh-term-dock){width:100%;flex-wrap:wrap}',
   '.dsh-term-dock{order:1;flex:none;box-sizing:border-box;width:calc(100% + var(--dsh-composer-side-clearance,16px) * 2);margin:0 calc(var(--dsh-composer-side-clearance,16px) * -1);position:relative;z-index:30;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:12px;overflow:hidden}',
-  '.dsh-term-dock-head{position:relative;z-index:31;padding-right:52px}',
   '.dsh-term-dock-drag{flex:none;height:5px;cursor:row-resize}',
   '.dsh-term-dock-drag:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18))}',
   '.dsh-term-dock-head{flex:none;display:flex;align-items:center;gap:8px;padding:6px 10px 4px;color:var(--dsw-alias-label-secondary,#ccc);font-size:12px}',
   '.dsh-term-dock-head svg{width:14px;height:14px}',
   '.dsh-term-dock-head-title{font-weight:500}',
   '.dsh-term-dock-head-cwd{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;direction:rtl;text-align:left}',
-  '.dsh-term-dock-body{flex:none;min-height:0}',
+  '.dsh-term-dock-body{flex:none;min-height:0;overflow:hidden}',
+  '.dsh-term-dock-body>section{height:100%}',
   '.dsh-term-iconbtn{width:24px;height:24px;flex:none;border:none;border-radius:6px;background:0 0;color:var(--dsw-alias-label-tertiary,#999);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:4px}',
   '.dsh-term-iconbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15));color:var(--dsw-alias-label-secondary,#ccc)}',
+  '.dsh-term-message{padding:12px 14px;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}',
   // settings row — metrics copied from the native Language row
   // (dsh-client-locale LanguageRow.module.css, figma 'Setting-Cell'):
   // 36px-tall pill, radius 18px, 14px text, platform-module background.
@@ -148,6 +87,7 @@ const CSS = [
 ].join('\n')
 
 function injectStyle() {
+  if (document.querySelector('style[data-plugin="dsh-terminal-button"]') !== null) return
   const el = document.createElement('style')
   el.setAttribute('data-plugin', name)
   el.textContent = CSS
@@ -185,43 +125,6 @@ function CloseGlyph({ size = 14 }) {
   )
 }
 
-function cssVar(name, fallback) {
-  const value = getComputedStyle(document.body).getPropertyValue(name).trim()
-  return value || fallback
-}
-
-function readTheme() {
-  const dark = document.body.hasAttribute('data-ds-dark-theme')
-  return {
-    background: cssVar('--dsw-alias-bg-base', dark ? '#151517' : '#ffffff'),
-    foreground: cssVar('--dsw-alias-label-primary', dark ? '#f9fafb' : '#0f1115'),
-    cursor: cssVar('--dsw-alias-label-primary', dark ? '#f9fafb' : '#0f1115'),
-    cursorAccent: cssVar('--dsw-alias-bg-base', dark ? '#151517' : '#ffffff'),
-    selectionBackground: dark ? 'rgba(255,255,255,0.22)' : 'rgba(38,49,72,0.18)',
-  }
-}
-
-function terminalFontFamily() {
-  return cssVar('--ds-font-family-code', 'Consolas, "Courier New", monospace')
-}
-
-async function wsUrl(sessionId, cwd, cols, rows) {
-  // Desktop loads the UI as dsh-app://app, whose origin cannot address the Host:
-  // its loopback port is ephemeral (DSH 0.2 starts the Host with --port 0), so
-  // resolve it from the live boot payload instead of assuming a port.
-  const httpBase = await resolveLoopbackBase(window)
-  const query = new URLSearchParams({ sessionId, cols: String(cols), rows: String(rows) })
-  if (cwd) query.set('cwd', cwd)
-  return webSocketUrl(httpBase, `${WS_PATH}?${query}`)
-}
-
-const STATE_LABEL = {
-  connecting: '连接中',
-  ready: '运行中',
-  exit: '已退出',
-  error: '错误',
-}
-
 // ---------------------------------------------------------------------------
 // Shared stores
 // ---------------------------------------------------------------------------
@@ -254,7 +157,8 @@ function closeDock() {
  * the user starts a session and then pop back on its own after the first
  * message. Collapsing on entry keeps the panel consistent: it is visible only
  * where it can be visible, and only an explicit "open terminal" brings it
- * back. The pinned shell keeps running; only the panel hides.
+ * back. The official terminal view keeps its Host process; hiding the panel
+ * only detaches the screen.
  *
  * `data-content-phase` is the conversation body's own phase marker
  * ('settling' | 'hero' | 'active'), used by DSH's layout CSS as well; runtimes
@@ -289,12 +193,16 @@ function watchConversationPhase() {
   return () => observer.disconnect()
 }
 
+// ---------------------------------------------------------------------------
+// Placement setting
+// ---------------------------------------------------------------------------
+
 /** Wrap one host-backed settingsScope key as a plain snapshot store. */
 function createSettingStore(scope, key, fallback) {
-  if (!scope) return createSnapshotStore(fallback)
+  if (!scope) return { getSnapshot: () => normalizePosition(fallback), subscribe: () => () => {}, set() {} }
   return {
     getSnapshot() {
-      return scope.getSnapshot()?.value?.[key] ?? fallback
+      return normalizePosition(scope.getSnapshot()?.value?.[key] ?? fallback)
     },
     subscribe(callback) {
       return scope.subscribe(callback)
@@ -323,14 +231,14 @@ function bindPositionStore(ctx) {
       namespace: SETTINGS_NAMESPACE,
       decode: (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : undefined),
     })
-    return createSettingStore(scope, POSITION_KEY, 'sidebar')
+    return createSettingStore(scope, POSITION_KEY, 'bottom')
   }
   const configForms = typeof ctx.get === 'function' ? ctx.get('configForms') : undefined
   if (typeof configForms?.get === 'function') {
     const scope = configForms.get(CONFIG_ENTRY_ID)
     return {
       getSnapshot() {
-        return scope.getSnapshot()?.value?.[POSITION_KEY] ?? 'sidebar'
+        return normalizePosition(scope.getSnapshot()?.value?.[POSITION_KEY])
       },
       subscribe(callback) {
         return scope.subscribe(callback)
@@ -351,7 +259,7 @@ function bindPositionStore(ctx) {
       },
     }
   }
-  return createSnapshotStore('sidebar')
+  return { getSnapshot: () => 'bottom', subscribe: () => () => {}, set() {} }
 }
 
 /**
@@ -359,9 +267,13 @@ function bindPositionStore(ctx) {
  * instead of the slot `inject` hooks conversion — that conversion is not
  * wired up on every slot's render path (e.g. conversation.composer.dock).
  */
-let positionStore = null
-/** Assigned in apply(); lets the host-driven open events reach the service. */
-let sidebarRightService = null
+let positionStore = {
+  getSnapshot: () => 'bottom',
+  subscribe: () => () => {},
+  set() {},
+}
+/** Assigned in apply(); keeps the official view's window hold across tab churn. */
+let retentionBridge = null
 
 function usePosition() {
   return React.useSyncExternalStore(
@@ -378,166 +290,31 @@ function useDock() {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal core (xterm + websocket), shared by sidebar tab and bottom dock.
-// The bottom dock pins one controller for the life of the page: session
-// switches unmount the slot, but detach() only parks the DOM.
+// Placement
 // ---------------------------------------------------------------------------
 
-const PINNED_EMPTY = Object.freeze({ state: 'connecting', info: null, boundCwd: '' })
-const pinnedTerminals = createPinnedRegistry()
-
-function terminalEnv() {
-  return {
-    wsUrl,
-    readTheme,
-    terminalFontFamily,
-    minCols: MIN_COLS,
-    minRows: MIN_ROWS,
+/**
+ * Open the terminal wherever the placement setting points.
+ * `external` has no in-app panel: ask the Host for the Desktop-native window.
+ */
+function openTerminal() {
+  if (positionStore.getSnapshot() === 'external') {
+    fetch(OPEN_NATIVE_PATH, { method: 'POST' }).catch(() => {})
+    return
   }
-}
-
-function usePinnedGeneration() {
-  return React.useSyncExternalStore(
-    (callback) => pinnedTerminals.subscribe(callback),
-    () => pinnedTerminals.generation,
-  )
-}
-
-function usePinnedSnapshot() {
-  return React.useSyncExternalStore(
-    (callback) => pinnedTerminals.subscribe(callback),
-    () => pinnedTerminals.current?.getSnapshot() ?? PINNED_EMPTY,
-  )
-}
-
-function TerminalView({ ctx, sessionId, cwdHint, signal, pinned = false }) {
-  const slotRef = React.useRef(null)
-  const [attempt, setAttempt] = React.useState(0)
-  const generation = usePinnedGeneration()
-  const hints = React.useRef({ ctx, sessionId, cwdHint })
-  hints.current = { ctx, sessionId, cwdHint }
-  const [snapshot, setSnapshot] = React.useState(() => (
-    pinned
-      ? (pinnedTerminals.current?.getSnapshot() ?? { state: 'connecting', info: null, boundCwd: cwdHint || '' })
-      : { state: 'connecting', info: null, boundCwd: cwdHint || '' }
-  ))
-
-  const createPinned = React.useCallback(() => {
-    const hint = hints.current
-    return createTerminalController(terminalEnv(), {
-      ctx: hint.ctx,
-      sessionId: hint.sessionId,
-      cwdHint: hint.cwdHint,
-      onSnapshot: () => pinnedTerminals.notify(),
-    })
-  }, [])
-
-  // Bottom dock: reuse the pinned shell. sessionId is a dep so the first
-  // id to arrive can spawn, and later session switches only reattach.
-  React.useLayoutEffect(() => {
-    if (!pinned) return undefined
-    const slot = slotRef.current
-    if (!slot) return undefined
-    if (!hints.current.sessionId && !pinnedTerminals.current) return undefined
-    const controller = pinnedTerminals.acquire(createPinned)
-    setSnapshot(controller.getSnapshot())
-    const off = controller.subscribe(setSnapshot)
-    controller.attach(slot)
-    return () => {
-      off()
-      controller.detach()
-    }
-  }, [pinned, generation, sessionId, createPinned])
-
-  // Sidebar tab: one shell per mounted tab. Unmount (tab close, session
-  // switch) disposes it — that placement is session-scoped on purpose.
-  React.useLayoutEffect(() => {
-    if (pinned) return undefined
-    const slot = slotRef.current
-    if (!slot || !sessionId) return undefined
-    const controller = createTerminalController(terminalEnv(), { ctx, sessionId, cwdHint })
-    setSnapshot(controller.getSnapshot())
-    const off = controller.subscribe(setSnapshot)
-    controller.attach(slot)
-    const onAbort = () => controller.dispose()
-    signal?.addEventListener('abort', onAbort, { once: true })
-    return () => {
-      off()
-      signal?.removeEventListener('abort', onAbort)
-      controller.dispose()
-    }
-  }, [pinned, sessionId, cwdHint, attempt, signal])
-
-  const { state, info } = snapshot
-  const shownPath = state === 'error' && info?.message
-    ? info.message
-    : (info?.cwd || snapshot.boundCwd || cwdHint || '')
-
-  return (
-    <div className="dsh-term-panel">
-      <div className="dsh-term-slot" ref={slotRef} />
-      <div className="dsh-term-status">
-        <span className="dsh-term-badge" data-state={state}>{STATE_LABEL[state] ?? state}</span>
-        <span className="dsh-term-status-path" title={info?.message || shownPath}>
-          {shownPath}
-        </span>
-        {state === 'exit' || state === 'error' ? (
-          <button
-            type="button"
-            className="dsh-term-restart"
-            onClick={() => {
-              if (pinned) pinnedTerminals.restart(createPinned)
-              else setAttempt((n) => n + 1)
-            }}
-          >
-            重开终端
-          </button>
-        ) : null}
-      </div>
-    </div>
-  )
+  openDock()
 }
 
 // ---------------------------------------------------------------------------
-// Sidebar placement
-// ---------------------------------------------------------------------------
-
-function TerminalBody(props, ctx) {
-  // DSH <= 0.1.5 hands entries useTabInfo/useSessions hooks; DSH >= 0.1.7
-  // delivers the session id as a standard prop of every session-scope slot
-  // and the tab's AbortSignal through the slot hook context.
-  const { sessionId, useSessions } = props
-  const tab = typeof props.useTabInfo === 'function' ? props.useTabInfo().tab : undefined
-  const signal = tab?.signal ?? props.hookContext?.signal
-  const cwdHint = typeof useSessions === 'function'
-    ? useSessions((sessions) => sessions.byId?.[sessionId]?.cwd)
-    : undefined
-  return <TerminalView ctx={ctx} sessionId={sessionId} cwdHint={cwdHint} signal={signal} />
-}
-
-function TerminalTitle(props) {
-  const tab = typeof props.useTabInfo === 'function' ? props.useTabInfo().tab : undefined
-  return (
-    <span className="dsh-term-title">
-      <SquareTerminalGlyph size={14} />
-      {tab?.title ?? '终端'}
-    </span>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Bottom dock placement (conversation.composer.dock, session scope).
-// The slot unmounts on session switch; TerminalView pinned keeps the shell.
+// Bottom panel
 // ---------------------------------------------------------------------------
 
 function TerminalDock(props, ctx) {
   const { sessionId, useSessions } = props
   const dock = useDock()
-  const pinned = usePinnedSnapshot()
   const cwdHint = typeof useSessions === 'function'
     ? useSessions((sessions) => sessions.byId?.[sessionId]?.cwd)
     : undefined
-  const shownCwd = pinned.info?.cwd || pinned.boundCwd || cwdHint || ''
 
   const onDragStart = React.useCallback((event) => {
     event.preventDefault()
@@ -564,7 +341,7 @@ function TerminalDock(props, ctx) {
       <div className="dsh-term-dock-head">
         <SquareTerminalGlyph size={14} />
         <span className="dsh-term-dock-head-title">终端</span>
-        <span className="dsh-term-dock-head-cwd" title={shownCwd}>{shownCwd}</span>
+        <span className="dsh-term-dock-head-cwd" title={cwdHint ?? ''}>{cwdHint ?? ''}</span>
         <button
           type="button"
           className="dsh-term-iconbtn"
@@ -576,13 +353,14 @@ function TerminalDock(props, ctx) {
         </button>
       </div>
       <div className="dsh-term-dock-body" style={{ height: dock.height ?? 260 }}>
-        <TerminalView ctx={ctx} sessionId={sessionId} cwdHint={cwdHint} pinned />
+        {sessionId
+          ? <BottomTerminal key={sessionId} ctx={ctx} sessionId={sessionId} retention={retentionBridge} />
+          : <div className="dsh-term-message">请先在会话中打开终端</div>}
       </div>
     </div>
   )
 }
 
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Settings row
 // ---------------------------------------------------------------------------
@@ -596,7 +374,7 @@ function TerminalPositionSettingRow() {
     <div className="dsh-term-setting">
       <div className="dsh-term-setting-text">
         <span className="dsh-term-setting-title">终端显示位置</span>
-        <span className="dsh-term-setting-desc">终端打开在右侧栏、底部面板，或改用系统终端弹窗</span>
+        <span className="dsh-term-setting-desc">终端打开在底部面板，或改用系统终端弹窗（右侧栏终端由官方提供）</span>
         {error ? <span className="dsh-term-setting-error" role="alert">{error}</span> : null}
       </div>
       <Menu
@@ -621,7 +399,7 @@ function TerminalPositionSettingRow() {
             aria-expanded={open}
             onClick={() => setOpen((value) => !value)}
           >
-            {POSITIONS[position] ?? POSITIONS.sidebar}
+            {POSITIONS[position] ?? POSITIONS.bottom}
             {IconChevronDownOutline14 ? <IconChevronDownOutline14 /> : null}
           </button>
         )}
@@ -640,13 +418,6 @@ function TerminalPositionConfigPage(props) {
 // Host-driven open events (Desktop titlebar / tray / settings entry points)
 // ---------------------------------------------------------------------------
 
-function openPluginPanel() {
-  const position = positionStore.getSnapshot()
-  if (position === 'bottom') openDock()
-  else if (position !== 'external') sidebarRightService?.openTab(TAB_KIND)
-  // 'external' never reaches here: the host gate keeps the native behavior.
-}
-
 /**
  * Subscribe to both host-driven open channels:
  *  - SSE `/dsh-terminal/events`: tray item and settings-page entry points,
@@ -664,17 +435,11 @@ function installOpenEvents() {
   if (typeof EventSource === 'function') {
     const source = new EventSource(EVENTS_PATH)
     source.onmessage = (event) => {
-      if (event.data === 'open') openPluginPanel()
+      if (event.data === 'open') openTerminal()
     }
     cleanups.push(() => source.close())
   }
-  const onNativeOpen = () => {
-    if (positionStore.getSnapshot() === 'external') {
-      fetch(OPEN_NATIVE_PATH, { method: 'POST' }).catch(() => {})
-      return
-    }
-    openPluginPanel()
-  }
+  const onNativeOpen = () => openTerminal()
   window.addEventListener('dsh-desktop:open-terminal', onNativeOpen)
   cleanups.push(() => window.removeEventListener('dsh-desktop:open-terminal', onNativeOpen))
   return () => {
@@ -683,9 +448,8 @@ function installOpenEvents() {
 }
 
 // ---------------------------------------------------------------------------
-// Conversation header button (conversation.session.header.actions — declared
-// by both DSH 0.1.5 and 0.1.7): opens the panel wherever the placement
-// setting points.
+// Conversation header button (conversation.session.header.actions): opens the
+// terminal wherever the placement setting points.
 // ---------------------------------------------------------------------------
 
 function TerminalHeaderButton() {
@@ -695,7 +459,7 @@ function TerminalHeaderButton() {
       className="dsh-term-header-btn"
       aria-label="打开终端"
       title="打开终端"
-      onClick={() => openPluginPanel()}
+      onClick={() => openTerminal()}
     >
       <SquareTerminalGlyph size={16} />
     </button>
@@ -713,47 +477,24 @@ export function apply(ctx) {
   dockStore.set({ ...(dockStore.getSnapshot() ?? {}), open: false })
 
   positionStore = bindPositionStore(ctx)
-  sidebarRightService = ctx.sidebarRight
+
+  // Keep the official terminal service's window holds aware of a bottom-panel
+  // terminal that has no sidebar tab. Disposed with this plugin fiber.
+  retentionBridge = createRetentionBridge(ctx.webTerminals)
+  ctx.effect(() => () => {
+    retentionBridge?.dispose()
+    retentionBridge = null
+  })
 
   ctx.effect(() => installOpenEvents())
   // Hide the bottom panel on the new-session screen instead of letting it
   // reappear by itself once the first message starts the conversation.
   ctx.effect(() => watchConversationPhase())
-  // Drop the pinned PTY when this client bundle is torn down. Session
-  // switches only detach it; they must not reach this disposer.
-  ctx.effect(() => () => {
-    pinnedTerminals.dispose()
-  })
-
-  ctx.effect(() => ctx.sidebarRightTabs.register({
-    id: TAB_ID,
-    kind: TAB_KIND,
-    priority: 'extension',
-    title: () => '终端',
-    guide: [{
-      id: TAB_ID, // required since DSH 0.1.7 (stable entry identity on the guide page)
-      order: 20,
-      title: () => '终端',
-      description: () => '在侧栏打开内置终端，工作目录为当前工作区根目录',
-      icon: SquareTerminalGlyph,
-    }],
-  }))
-
-  ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register(
-    { name: 'sidebar.right.pane.tab', key: TAB_ID },
-    (props) => TerminalBody(props, ctx),
-  ))
-
-  ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register(
-    { name: 'sidebar.right.pane.tab.title', key: TAB_ID },
-    TerminalTitle,
-  ))
 
   // conversation.composer.dock renders inside the composer card's bottom
   // row, after the input card — the CSS above wraps that row so the dock
   // takes a full-width line below the token meter, at the very bottom of the
-  // session column. (conversation.input.dock renders ABOVE the input card,
-  // which is the wrong end of the composer.)
+  // session column.
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register(
     {
       name: 'conversation.composer.dock',

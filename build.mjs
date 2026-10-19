@@ -1,7 +1,9 @@
 /**
  * Bundles src/client.jsx into client.js, a classic script that self-registers
  * with DSH's client module loader. Only platform seed modules stay external
- * (they resolve through the loader's `require`); xterm and its CSS inline.
+ * (they resolve through the loader's `require`); the terminal screen and the
+ * xterm stack are the official terminal package's own lazy chunk, loaded at
+ * runtime, so this bundle carries no renderer.
  */
 import { build } from 'esbuild'
 
@@ -15,7 +17,6 @@ await build({
   jsx: 'transform',
   jsxFactory: 'React.createElement',
   jsxFragment: 'React.Fragment',
-  loader: { '.css': 'text' },
   external: [
     'react',
     'react/jsx-runtime',

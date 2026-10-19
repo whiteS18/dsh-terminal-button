@@ -1,37 +1,33 @@
 /**
  * dsh-terminal-button — Host half (static bundle).
  *
- * Replaces DSH's "open a system terminal window" affordance with an in-app
- * terminal: the browser client bundle mounts an xterm.js panel in the right
- * sidebar and talks to this host over a same-origin WebSocket registered on
- * the DSH web server (`registerUpgrade`, path `/dsh-terminal/pty`).
+ * An extension of DeepSeek Harness's official terminal (DSH >= 0.2.1), not a
+ * second terminal implementation. It does not spawn a PTY and serves no
+ * WebSocket: the official `@deepseek-ai/dsh-api-terminal-controller` owns the
+ * terminal processes and the official sidebar-terminal client owns the screen.
+ * What this half adds:
  *
- * Wire protocol (per connection):
- *   client -> host  text JSON:  { type: 'input', data } | { type: 'resize', cols, rows }
- *   host  -> client binary:     raw PTY output chunks (UTF-8)
- *   host  -> client text JSON:  { type: 'ready', cwd, shell, pid }
- *                               { type: 'exit', exitCode, signal }
- *                               { type: 'error', message }
+ *  - Desktop "open terminal" redirection. Tray, settings-page and titlebar
+ *    entry points funnel through the Desktop runtime's `openTerminal`, so one
+ *    method patch covers them all: in the 'bottom' placement it broadcasts an
+ *    SSE `open` frame to connected clients (the client half reveals the
+ *    bottom panel), and in the 'external' placement it falls through to the
+ *    original system-terminal window. `/dsh-terminal/open-native` is the
+ *    explicit escape hatch.
+ *  - The `dsh` CLI shim. Desktop has no `dsh` executable on PATH (the CLI
+ *    lives inside `app.asar`), and the official terminal only forwards
+ *    `DSH_SESSION_ID` in the spawn env. Patching `subprocess.spawnTerminal`
+ *    once — rather than owning a PTY — puts the shim directory on PATH for
+ *    every official terminal, sidebar and bottom panel alike, without
+ *    re-injecting any `DSH_*` variable.
  *
- * The PTY is spawned through DSH's own `subprocess` service
- * (`ctx.subprocess.spawnTerminal`, backed by node-pty/ConPTY), so no native
- * dependency is bundled with this plugin. The shell's cwd is resolved
- * server-side from the connecting session id — the session workspace root,
- * never the DSH profile directory: live in-memory session first, then the
- * persisted session log via `sessionQuery`, then the client-supplied hint,
- * then the sandbox workspace root, and finally process.cwd().
- *
- * Deliberately dependency-free: the WebSocket framing is implemented on top
- * of the raw upgrade socket with only node:crypto, mirroring
- * dsh-handoff-button's "no runtime deps" stance so the bundle profile needs
- * nothing beyond this package.
+ * Routes: `GET /dsh-terminal/events` (SSE open intents),
+ * `POST /dsh-terminal/open-native` (system window), `GET /dsh-terminal/health`.
  */
-import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join, sep } from 'node:path'
-import { encodeFrame, FrameParser } from './frames.js'
 
 // Resolved from the DSH install anchor at runtime; absent in bare test
 // environments, where settings registration is simply skipped.
@@ -64,15 +60,19 @@ const markVolatile = (schema) => {
   return schema
 }
 
+/**
+ * Stored placements. `sidebar` is accepted for profiles written by <= 0.3.x
+ * (this plugin's own sidebar tab); the official sidebar terminal now owns
+ * that surface, so it normalizes to the bottom panel.
+ */
+const positions = ['sidebar', 'bottom', 'external']
 const positionSchema = Schema
-  ? markVolatile(Schema.union(['sidebar', 'bottom', 'external']).default('sidebar'))
+  ? markVolatile(Schema.union(positions).default('bottom'))
   : undefined
 
-/** Client placement setting; user layer lives in $DSH_HOME/settings.yaml (<= 0.1.5). */
 const SettingsSchema = Schema?.object({
-  // Where "open terminal" goes: an in-app panel ('sidebar' | 'bottom') or
-  // the Desktop-native system terminal window ('external'). The host half
-  // reads this to gate its desktopRuntime.openTerminal interception.
+  // 'bottom' renders the official terminal in the in-app bottom panel;
+  // 'external' lets the Desktop-native system terminal window open instead.
   position: positionSchema,
 })
 
@@ -86,43 +86,16 @@ export const Config = SettingsSchema
   ? Schema.object({ position: positionSchema })
   : undefined
 
-const UPGRADE_PATH = '/dsh-terminal/pty'
-const HEALTH_PATH = '/dsh-terminal/health'
 /** SSE channel pushing "open panel" intents to connected clients. */
 const EVENTS_PATH = '/dsh-terminal/events'
 /** Explicit escape hatch: always spawn the Desktop system terminal window. */
 const OPEN_NATIVE_PATH = '/dsh-terminal/open-native'
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
-/** Reject absurd terminal geometries from a confused client. */
-const MAX_COLS = 500
-const MAX_ROWS = 200
-/**
- * PSReadLine disables its ListView prediction and warns at every prompt when
- * the console window is smaller than 50x5. The client floors its geometry at
- * this minimum; enforce it host-side too so a stale/foreign client can never
- * spawn or shrink a PTY below it.
- */
-const MIN_COLS = 50
-const MIN_ROWS = 5
+/** Liveness probe so a browser request confirms the Host half loaded. */
+const HEALTH_PATH = '/dsh-terminal/health'
 
 // ---------------------------------------------------------------------------
-// Minimal RFC 6455 framing (server side: accepts masked client frames,
-// emits unmasked server frames, assembles fragmented messages).
+// `dsh` CLI shim
 // ---------------------------------------------------------------------------
-
-function acceptKey(key) {
-  return createHash('sha1').update(key + WS_GUID).digest('base64')
-}
-
-// ---------------------------------------------------------------------------
-// Shell / cwd resolution
-// ---------------------------------------------------------------------------
-
-function clampDimension(value, max, fallback) {
-  const n = Number(value)
-  if (!Number.isInteger(n) || n < 1 || n > max) return fallback
-  return n
-}
 
 /**
  * How to invoke the `dsh` CLI from a shell that no longer has `DSH_*`.
@@ -157,13 +130,20 @@ function dshInvocation() {
   return { command: node, prefix: ['--expose-internals', cli] }
 }
 
+/** Cached shim directory, including a cached "unavailable" result. */
+let shimDirCache
+
 /**
  * Directory containing a `dsh` the PTY can run after `DSH_*` is stripped.
  * @returns {string | undefined}
  */
 function dshShimDir() {
+  if (shimDirCache !== undefined) return shimDirCache || undefined
   const invocation = dshInvocation()
-  if (!invocation) return undefined
+  if (!invocation) {
+    shimDirCache = ''
+    return undefined
+  }
   const dir = join(tmpdir(), 'dsh-terminal-bin')
   const quote = (value) => `"${value}"`
   try {
@@ -182,11 +162,16 @@ function dshShimDir() {
         { mode: 0o755 },
       )
     }
+    shimDirCache = dir
     return dir
   } catch {
+    shimDirCache = ''
     return undefined
   }
 }
+
+let loginPathResolved = false
+let cachedLoginPath
 
 /**
  * Ask the login shell which PATH the user actually has. The Host process is
@@ -196,6 +181,8 @@ function dshShimDir() {
  * started as a login shell there instead.
  */
 function loginPath() {
+  if (loginPathResolved) return cachedLoginPath
+  loginPathResolved = true
   if (process.platform === 'win32') return undefined
   const shell = process.env.SHELL || '/bin/bash'
   try {
@@ -205,226 +192,74 @@ function loginPath() {
       windowsHide: true,
     })
     const path = result.stdout?.trim()
-    if (result.status === 0 && path) return path
+    if (result.status === 0 && path) cachedLoginPath = path
   } catch { /* login shell unavailable; keep the inherited PATH */ }
-  return undefined
+  return cachedLoginPath
+}
+
+let terminalPathCache
+
+/** PATH pieces used for every terminal spawn, resolved once per Host run. */
+function terminalPathParts() {
+  if (terminalPathCache !== undefined) return terminalPathCache
+  const shimDir = dshShimDir()
+  const fallbackPath = process.platform === 'win32'
+    ? (process.env.Path ?? process.env.PATH ?? '')
+    : (loginPath() ?? process.env.PATH ?? '')
+  terminalPathCache = { shimDir: shimDir ?? '', fallbackPath }
+  return terminalPathCache
 }
 
 /**
- * Environment for the interactive shell.
+ * Put the `dsh` shim directory first on a terminal spawn environment.
  *
- * `scrubbedParentEnv` drops `DSH_*` (so harness secrets never leak) but that
- * also drops `DSH_EXECUTABLE`, which is how `dsh` finds itself. Put that
- * launcher back on PATH. On POSIX, also replace PATH with the login shell's
- * PATH so version managers installed in the user profile resolve.
+ * A caller-provided PATH is kept (the shim is only prepended); otherwise the
+ * login/user PATH is used so version-manager shims still resolve. PATH is the
+ * only lever: the subprocess service merges this explicit env over the
+ * scrubbed parent environment, so no `DSH_*` fact is forwarded.
+ *
+ * @param {unknown} env - caller-provided terminal environment.
+ * @param {{ shimDir?: string, fallbackPath?: string }} parts - PATH sources.
+ * @param {string} [platform] - target platform (injectable for tests).
+ * @returns {Record<string, string | undefined>} the patched environment.
  */
-function shellEnv() {
-  const env = { ...process.env, TERM: 'xterm-256color', DSH_TERMINAL: '1' }
-  const shimDir = dshShimDir()
-  if (shimDir) {
-    const inherited = env.PATH || env.Path || ''
-    const dirs = inherited.split(delimiter).filter((dir) => dir && dir !== shimDir)
-    env.PATH = [shimDir, ...dirs].join(delimiter)
-    if (process.platform === 'win32') env.Path = env.PATH
-  }
-  if (process.platform !== 'win32') {
-    const path = loginPath()
-    if (path) {
-      env.PATH = shimDir ? [shimDir, path].join(delimiter) : path
-    }
-  }
-  return env
+export function withTerminalPath(env, parts = {}, platform = process.platform) {
+  const base = env !== null && typeof env === 'object' ? { ...env } : {}
+  const shimDir = typeof parts.shimDir === 'string' ? parts.shimDir : ''
+  if (shimDir === '') return base
+  const existingKey = Object.keys(base).find((key) => key.toUpperCase() === 'PATH')
+  const existing = existingKey === undefined ? undefined : base[existingKey]
+  for (const key of Object.keys(base)) if (key.toUpperCase() === 'PATH') delete base[key]
+  const rest = typeof existing === 'string' && existing !== ''
+    ? existing
+    : (typeof parts.fallbackPath === 'string' ? parts.fallbackPath : '')
+  base[platform === 'win32' ? 'Path' : 'PATH'] = rest === '' ? shimDir : `${shimDir}${delimiter}${rest}`
+  return base
 }
 
-function pickShell(query) {
-  const override = query.get('shell') || process.env.DSH_TERMINAL_SHELL
-  if (override) {
-    const named = {
-      powershell: { argv: ['powershell.exe', '-NoLogo'] },
-      pwsh: { argv: ['pwsh.exe', '-NoLogo'] },
-      cmd: { argv: ['cmd.exe'] },
-      bash: { argv: ['bash', '-l'] },
+/**
+ * Add the `dsh` shim to every Host terminal through the one spawn primitive
+ * the official terminal controller uses. Patched once per Host run and
+ * restored when this fiber unloads.
+ */
+function installTerminalPath(ctx) {
+  ctx.effect(() => {
+    const service = ctx.subprocess
+    const original = service?.spawnTerminal
+    if (typeof original !== 'function' || original.__dshTerminalButtonPatched) return undefined
+    const patched = function patchedSpawnTerminal(spec) {
+      if (spec === null || typeof spec !== 'object') return original.apply(this, arguments)
+      const parts = terminalPathParts()
+      if (parts.shimDir === '') return original.apply(this, arguments)
+      const env = withTerminalPath(spec.env, parts)
+      return original.apply(this, [{ ...spec, env }])
     }
-    const hit = named[override.toLowerCase()]
-    if (hit) return hit
-    return { argv: [override] }
-  }
-  if (process.platform === 'win32') {
-    // Windows PowerShell 5.1 is what prints the user's PS5 profile banner
-    // ("ep=enable | dp=disable | pstat=status") and lacks the PS7 profile's
-    // PATH additions. Prefer PowerShell 7 when it is installed.
-    const pwsh = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe')
-    if (existsSync(pwsh)) return { argv: [pwsh, '-NoLogo'] }
-    return { argv: ['pwsh.exe', '-NoLogo'] }
-  }
-  return { argv: [process.env.SHELL || '/bin/bash', '-l'] }
-}
-
-async function resolveCwd(ctx, sessionId, hint) {
-  if (sessionId) {
-    try {
-      const sessions = ctx.get('sessions')
-      const session = sessions?.get?.(sessionId)
-      const cwd = session?.header?.cwd ?? session?.cwd
-      if (typeof cwd === 'string' && cwd) return cwd
-    } catch { /* service absent or session not live */ }
-    try {
-      const sessionQuery = ctx.get('sessionQuery')
-      const log = await sessionQuery?.readSession?.(sessionId)
-      const cwd = log?.session?.cwd ?? log?.session?.header?.cwd ?? log?.header?.cwd
-      if (typeof cwd === 'string' && cwd) return cwd
-    } catch { /* no persisted log */ }
-  }
-  if (typeof hint === 'string' && hint) return hint
-  try {
-    const sandboxPolicy = ctx.get('sandboxPolicy')
-    if (typeof sandboxPolicy?.workspaceRoot === 'string' && sandboxPolicy.workspaceRoot) {
-      return sandboxPolicy.workspaceRoot
+    patched.__dshTerminalButtonPatched = true
+    service.spawnTerminal = patched
+    return () => {
+      if (service.spawnTerminal === patched) service.spawnTerminal = original
     }
-  } catch { /* fall through */ }
-  return process.cwd()
-}
-
-// ---------------------------------------------------------------------------
-// Connection lifecycle
-// ---------------------------------------------------------------------------
-
-function sendJson(socket, message) {
-  if (socket.destroyed) return
-  socket.write(encodeFrame(0x1, Buffer.from(JSON.stringify(message), 'utf8')))
-}
-
-function sendBinary(socket, chunk) {
-  if (socket.destroyed) return false
-  return socket.write(encodeFrame(0x2, chunk))
-}
-
-async function handleConnection(ctx, req, socket, head) {
-  const key = req.headers['sec-websocket-key']
-  if (!key || String(req.headers.upgrade).toLowerCase() !== 'websocket') {
-    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
-    socket.destroy()
-    return
-  }
-  // The SPA is same-origin with this server; refuse cross-site hijacking
-  // attempts that present a foreign Origin header.
-  const origin = req.headers.origin
-  if (origin) {
-    try {
-      if (new URL(origin).host !== req.headers.host) throw new Error('origin mismatch')
-    } catch {
-      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
-      socket.destroy()
-      return
-    }
-  }
-
-  const url = new URL(req.url, 'http://dsh.internal')
-  const query = url.searchParams
-  const sessionId = query.get('sessionId') || ''
-  const cwd = await resolveCwd(ctx, sessionId, query.get('cwd'))
-  const { argv } = pickShell(query)
-  const cols = Math.max(MIN_COLS, clampDimension(query.get('cols'), MAX_COLS, 80))
-  const rows = Math.max(MIN_ROWS, clampDimension(query.get('rows'), MAX_ROWS, 24))
-
-  let handle
-  try {
-    handle = await ctx.subprocess.spawnTerminal({
-      argv,
-      cwd,
-      cols,
-      rows,
-      // DSH >= 0.1.6 requires terminalType; older runtimes ignore it.
-      terminalType: 'xterm-256color',
-      env: shellEnv(),
-    })
-  } catch (error) {
-    socket.write(
-      'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`,
-    )
-    sendJson(socket, { type: 'error', message: `failed to spawn shell: ${error?.message ?? error}` })
-    socket.end(encodeFrame(0x8, Buffer.alloc(0)))
-    return
-  }
-
-  socket.write(
-    'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-      `Sec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`,
-  )
-
-  const parser = new FrameParser()
-  if (head?.length) parser.push(head) // normally empty
-  let cleaned = false
-  const cleanup = () => {
-    if (cleaned) return
-    cleaned = true
-    handle.output.removeAllListeners('data')
-    handle.terminate().catch(() => {})
-    if (!socket.destroyed) socket.destroy()
-  }
-
-  handle.output.on('data', (chunk) => {
-    const flushed = sendBinary(socket, chunk)
-    if (!flushed) {
-      handle.output.pause()
-      socket.once('drain', () => handle.output.resume())
-    }
-  })
-  handle.done.then(
-    ({ exitCode, signal }) => {
-      if (!socket.destroyed) {
-        sendJson(socket, { type: 'exit', exitCode, signal })
-        socket.end(encodeFrame(0x8, Buffer.alloc(0)))
-      }
-      cleaned = true
-    },
-    () => {},
-  )
-
-  sendJson(socket, { type: 'ready', cwd, shell: argv[0], pid: handle.pid })
-
-  socket.on('data', (chunk) => {
-    let messages
-    try {
-      messages = parser.push(chunk)
-    } catch {
-      cleanup()
-      return
-    }
-    for (const message of messages) {
-      if (message.opcode === 0x8) {
-        cleanup()
-        return
-      }
-      if (message.opcode === 0x9) {
-        if (!socket.destroyed) socket.write(encodeFrame(0xA, message.payload))
-        continue
-      }
-      if (message.opcode !== 0x1 && message.opcode !== 0x2) continue
-      let decoded
-      try {
-        decoded = JSON.parse(message.payload.toString('utf8'))
-      } catch {
-        continue
-      }
-      if (decoded?.type === 'input' && typeof decoded.data === 'string') {
-        handle.write(decoded.data).catch(() => {})
-      } else if (decoded?.type === 'resize') {
-        const nextCols = Math.max(MIN_COLS, clampDimension(decoded.cols, MAX_COLS, cols))
-        const nextRows = Math.max(MIN_ROWS, clampDimension(decoded.rows, MAX_ROWS, rows))
-        // DSH <= 0.1.5 nested the pty on handle.terminal; 0.1.7 exposes resize
-        // directly on the terminal handle.
-        const resize = typeof handle.resize === 'function'
-          ? handle.resize.bind(handle)
-          : handle.terminal?.resize?.bind(handle.terminal)
-        if (!resize) continue
-        Promise.resolve(resize(nextCols, nextRows)).catch(() => { /* pty already gone */ })
-      }
-    }
-  })
-  socket.on('error', cleanup)
-  socket.on('close', cleanup)
+  }, 'dsh-terminal-button: terminal PATH')
 }
 
 // ---------------------------------------------------------------------------
@@ -465,12 +300,15 @@ function unwrapVolatile(value) {
   return value
 }
 
+/** Normalized placement: only 'external' changes the Host behavior. */
 function currentPosition() {
   try {
-    if (settingsScope) return settingsScope.get()?.position ?? 'sidebar'
-    return unwrapVolatile(liveConfig?.position) ?? 'sidebar'
+    const value = settingsScope
+      ? settingsScope.get()?.position
+      : unwrapVolatile(liveConfig?.position)
+    return value === 'external' ? 'external' : 'bottom'
   } catch {
-    return 'sidebar'
+    return 'bottom'
   }
 }
 
@@ -514,7 +352,7 @@ export function apply(ctx, config) {
   // and the client-side settingsScope mirror can resolve `position`. The owner
   // scope also feeds the host-side interception gate.
   // DSH >= 0.1.6 removed `settings.register`: the volatile Config field above
-  // carries `position` instead, and currentPosition() reads its live box.
+  // carries `position`, and currentPosition() reads its live box.
   if (SettingsSchema) {
     ctx.inject(['settings'], (settingsCtx) => {
       if (typeof settingsCtx.settings?.register !== 'function') return undefined
@@ -526,6 +364,7 @@ export function apply(ctx, config) {
   }
 
   installDesktopInterception(ctx)
+  installTerminalPath(ctx)
 
   // SSE channel: the patched desktopRuntime.openTerminal broadcasts 'open'
   // here; the client bundle listens and reveals the panel.
@@ -566,7 +405,7 @@ export function apply(ctx, config) {
     }
   })
 
-  // Escape hatch for the plugin's own buttons in 'external' mode: always
+  // Escape hatch for the plugin's own controls in 'external' mode: always
   // spawns the Desktop system terminal window, bypassing the interception.
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
@@ -604,17 +443,4 @@ export function apply(ctx, config) {
       res.end(JSON.stringify({ ok: true, name }))
     },
   }))
-
-  ctx.effect(() => ctx.webServer.registerUpgrade({
-    path: UPGRADE_PATH,
-    handler: (req, socket, head) => {
-      handleConnection(ctx, req, socket, head).catch((error) => {
-        console.error('[dsh-terminal] connection failed:', error)
-        socket.destroy()
-      })
-    },
-  }))
 }
-
-export { encodeFrame, FrameParser } from './frames.js'
-
