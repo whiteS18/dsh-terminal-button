@@ -90,6 +90,12 @@ npm test        # node --test
 - `curl http://127.0.0.1:<port>/dsh-terminal/health` → `{"ok":true}` 表示 Host 半部已加载。
 - 底部面板加载失败时面板内会显示原因（官方 chunk 不可用 / `webTerminals` 服务缺失）。
 
+## 更新说明
+
+版本变更（功能、修复、不兼容调整）见 [CHANGELOG.md](./CHANGELOG.md)。
+
+> 0.4.x 为「官方终端扩展」重构（复用官方 PTY/传输/xterm）；0.3.x 为插件自带终端实现的旧架构。
+
 ## License
 
 MIT
