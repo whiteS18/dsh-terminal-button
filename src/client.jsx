@@ -49,6 +49,7 @@ import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import xtermCss from '@xterm/xterm/css/xterm.css'
 import { createPinnedRegistry } from './pinned-terminal.js'
 import { resolveLoopbackBase, webSocketUrl } from './loopback.js'
+import { shouldCollapseDock } from './dock-visibility.js'
 import { createTerminalController } from './terminal-session.js'
 
 const { Menu } = primitives
@@ -244,6 +245,48 @@ function openDock() {
 function closeDock() {
   const prev = dockStore.getSnapshot() ?? {}
   dockStore.set({ ...prev, open: false })
+}
+
+/**
+ * Collapse the bottom dock when the conversation enters its new-session
+ * ("hero") screen. DSH renders the `conversation.composer.dock` slot only on
+ * an active conversation, so a dock left open there would be invisible while
+ * the user starts a session and then pop back on its own after the first
+ * message. Collapsing on entry keeps the panel consistent: it is visible only
+ * where it can be visible, and only an explicit "open terminal" brings it
+ * back. The pinned shell keeps running; only the panel hides.
+ *
+ * `data-content-phase` is the conversation body's own phase marker
+ * ('settling' | 'hero' | 'active'), used by DSH's layout CSS as well; runtimes
+ * that lack it simply leave the dock alone. Only visible markers count, in
+ * case the shell keeps a background conversation view mounted.
+ */
+function watchConversationPhase() {
+  if (typeof MutationObserver !== 'function') return () => {}
+  const phases = () => Array.from(document.querySelectorAll('[data-content-phase]'))
+  // Cheap gate first: the attribute read costs no layout, and during normal
+  // streaming there is no hero marker at all.
+  const heroMarked = () => phases().some((el) => el.getAttribute('data-content-phase') === 'hero')
+  // Only visible markers count, in case the shell keeps a background
+  // conversation view mounted. `getClientRects` is deferred until a hero
+  // marker actually exists, so active streaming never forces layout here.
+  const heroVisible = () => phases().some(
+    (el) => el.getAttribute('data-content-phase') === 'hero' && el.getClientRects().length > 0,
+  )
+  const sync = () => {
+    if (!heroMarked()) return
+    if (!shouldCollapseDock('hero', dockStore.getSnapshot()?.open)) return
+    if (heroVisible()) closeDock()
+  }
+  const observer = new MutationObserver(sync)
+  observer.observe(document.body, {
+    attributes: true,
+    attributeFilter: ['data-content-phase'],
+    childList: true,
+    subtree: true,
+  })
+  sync()
+  return () => observer.disconnect()
 }
 
 /** Wrap one host-backed settingsScope key as a plain snapshot store. */
@@ -673,6 +716,9 @@ export function apply(ctx) {
   sidebarRightService = ctx.sidebarRight
 
   ctx.effect(() => installOpenEvents())
+  // Hide the bottom panel on the new-session screen instead of letting it
+  // reappear by itself once the first message starts the conversation.
+  ctx.effect(() => watchConversationPhase())
   // Drop the pinned PTY when this client bundle is torn down. Session
   // switches only detach it; they must not reach this disposer.
   ctx.effect(() => () => {

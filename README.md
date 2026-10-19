@@ -7,7 +7,7 @@ DeepSeek Harness 插件：把「打开终端」从弹出系统默认终端窗口
 - **内嵌终端**：会话头部工具栏新增终端图标按钮（Lucide `SquareTerminal`，与 DSH 标题栏原生终端按钮同一图标，插槽 `conversation.session.header.actions`，order 30），点击即打开内嵌终端。终端渲染用 [@xterm/xterm](https://www.npmjs.com/package/@xterm/xterm)（构建时内联进 `client.js`）
 - **原生入口拦截**：桌面版的「打开终端」原生入口（托盘 / 设置页 / 标题栏 IPC）也会被重定向到内嵌终端——Host 端 patch `desktopRuntime.openTerminal`，经 SSE `/dsh-terminal/events` 通知前端打开面板；选择「系统弹窗」时放行原生行为
 - **位置可配置**：插件 → 插件列表 → 本插件详情里的「终端显示位置」（原生 Menu 下拉；DSH 0.1.5 及更早仍在设置 → 通用）可选 **右侧栏**（DockKit Tab，支持分栏/浮动/折叠，默认）、**底部面板**（`conversation.composer.dock`，会话列最底部、token 用量表下方独占一行，与主界面同宽，从底部向上顶起输入框和对话内容而不遮挡——同 opencode 底部面板的做法；默认高 260px，顶部拖拽调高度，范围 120px~60% 窗高，只持久化高度、每次启动默认收起）或 **系统弹窗**。配置写入 profile 里 `terminal-plugin` 条目的 volatile `position` 字段，热更新、跨窗口同步。`position` 必须带 `meta.volatile`（schemastery ≥ 3.18.4 的 `.volatile()`，旧副本回退 `.extra('volatile', true)`），否则 Host 不服务该条目，详情页不会出现选择器。**注意：「系统弹窗」模式下会话头部的终端按钮点击无效**（此时请用系统原生入口，或经 `POST /dsh-terminal/open-native` 打开）
-- **底部终端不跟会话走**：底部面板的插槽是 session 作用域，切换会话会卸掉面板，但 shell 不是。同一个 xterm 和 PTY 会被摘下再挂上，不会新开进程、也不会清屏。关掉面板再打开还是这个 shell。要换一个新 shell，用状态栏的「重开终端」（工作目录取当前会话）
+- **底部终端不跟会话走**：底部面板的插槽是 session 作用域，切换会话会卸掉面板，但 shell 不是。同一个 xterm 和 PTY 会被摘下再挂上，不会新开进程、也不会清屏。关掉面板再打开还是这个 shell。要换一个新 shell，用状态栏的「重开终端」（工作目录取当前会话）。**例外是「新会话」界面**（hero，DSH 不渲染 `conversation.composer.dock` 槽位）：进入时面板会收起，且**不会**在发出第一条消息后自己弹回来（监听会话主体的 `data-content-phase="hero"`）；shell 仍在后台运行，点终端图标即可重新挂出
 - **主题跟随**：终端配色实时读取 DSH 的 CSS 设计变量（`--dsw-alias-bg-base` / `--dsw-alias-label-primary` 等），亮色 / 暗色切换、`theme/change` 事件都会即时刷新终端颜色与代码字体（`--ds-font-family-code`）
 - **工作区根目录**：PTY 的 cwd 由 Host 端根据会话 ID 解析（活跃会话 → 持久化会话日志 → 前端提示 → 沙箱根目录），**始终是当前会话工作区根目录，而不是 DSH 的 profile 目录**
 - **状态栏**：面板底部显示运行状态（连接中 / 运行中 / 已退出 / 错误）与 cwd；Shell 退出后可一键「重开终端」
@@ -53,6 +53,7 @@ dsh-terminal-button/
 ├── client.js          # Client 半部（构建产物，勿手改）：侧栏 Tab + 底部抽屉 + 设置行
 ├── src/client.jsx     # Client 源码（esbuild 打包，xterm/CSS 内联）
 ├── src/loopback.js    # Host 回环地址解析：桌面版动态端口 / 浏览器同源
+├── src/dock-visibility.js   # 底部面板在新会话（hero）界面的收起策略
 ├── src/pinned-terminal.js    # 底部 dock 的页面级终端 registry（detach/attach 复用）
 ├── src/terminal-session.js   # xterm + WebSocket 会话封装
 ├── build.mjs          # 构建脚本：npm run build

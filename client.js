@@ -6450,6 +6450,11 @@ function webSocketUrl(base, path) {
   return `${origin.replace(/^http/i, "ws")}${path}`;
 }
 
+// src/dock-visibility.js
+function shouldCollapseDock(phase, open) {
+  return phase === "hero" && open === true;
+}
+
 // src/terminal-session.js
 var import_xterm = __toESM(require_xterm(), 1);
 var import_addon_fit = __toESM(require_addon_fit(), 1);
@@ -6883,6 +6888,29 @@ function closeDock() {
   const prev = dockStore.getSnapshot() ?? {};
   dockStore.set({ ...prev, open: false });
 }
+function watchConversationPhase() {
+  if (typeof MutationObserver !== "function") return () => {
+  };
+  const phases = () => Array.from(document.querySelectorAll("[data-content-phase]"));
+  const heroMarked = () => phases().some((el) => el.getAttribute("data-content-phase") === "hero");
+  const heroVisible = () => phases().some(
+    (el) => el.getAttribute("data-content-phase") === "hero" && el.getClientRects().length > 0
+  );
+  const sync = () => {
+    if (!heroMarked()) return;
+    if (!shouldCollapseDock("hero", dockStore.getSnapshot()?.open)) return;
+    if (heroVisible()) closeDock();
+  };
+  const observer = new MutationObserver(sync);
+  observer.observe(document.body, {
+    attributes: true,
+    attributeFilter: ["data-content-phase"],
+    childList: true,
+    subtree: true
+  });
+  sync();
+  return () => observer.disconnect();
+}
 function createSettingStore(scope, key, fallback) {
   if (!scope) return (0, import_dsh_client_store.createSnapshotStore)(fallback);
   return {
@@ -7164,6 +7192,7 @@ function apply(ctx) {
   positionStore = bindPositionStore(ctx);
   sidebarRightService = ctx.sidebarRight;
   ctx.effect(() => installOpenEvents());
+  ctx.effect(() => watchConversationPhase());
   ctx.effect(() => () => {
     pinnedTerminals.dispose();
   });
