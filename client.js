@@ -115,13 +115,7 @@ function loadOfficialTerminalBody(ctx) {
   return pending;
 }
 
-// src/terminal-panel.jsx
-var VIEW_KEY = "dsh-terminal-bottom";
-var CONTENT_ID = "dsh-terminal-bottom";
-var FALLBACK_THEME = Object.freeze({
-  fontSizes: { terminal: 13 },
-  fontFamilies: { terminal: "" }
-});
+// src/terminal-status.js
 var MESSAGES = {
   new: "\u65B0\u5EFA\u7EC8\u7AEF",
   loading: "\u6B63\u5728\u8BFB\u53D6\u7EC8\u7AEF\u73AF\u5883\u2026",
@@ -142,22 +136,22 @@ var MESSAGES = {
   invalidOutput: "\u7EC8\u7AEF\u753B\u9762\u4F20\u8F93\u5F02\u5E38\uFF0C\u8BF7\u91CD\u65B0\u8FDE\u63A5\u3002",
   terminalLimit: "\u7EC8\u7AEF\u6570\u91CF\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8BF7\u5173\u95ED\u4E0D\u7528\u7684\u7EC8\u7AEF\u540E\u91CD\u8BD5\u3002\u5DF2\u9000\u51FA\u7684\u7EC8\u7AEF\u4E5F\u8BA1\u5165\u6570\u91CF\u3002"
 };
-function translate(key, params) {
-  const template = MESSAGES[key] ?? String(key ?? "");
-  if (params === void 0 || params === null) return template;
-  return template.replace(/\{(\w+)\}/g, (match, name2) => name2 in params ? String(params[name2]) : match);
-}
 var STATUS_LABELS = {
   connecting: "\u8FDE\u63A5\u4E2D",
   ready: "\u8FD0\u884C\u4E2D",
   exit: "\u5DF2\u9000\u51FA",
   error: "\u9519\u8BEF"
 };
+function translate(key, params) {
+  const template = MESSAGES[key] ?? String(key ?? "");
+  if (params === void 0 || params === null) return template;
+  return template.replace(/\{(\w+)\}/g, (match, name2) => name2 in params ? String(params[name2]) : match);
+}
 function statusOf(state) {
   const phase = state?.phase;
   const info = state?.info;
   if (phase === "failed" || phase === "disconnected" || info?.state === "failed") {
-    const message = typeof state?.error === "string" && state.error !== "" ? state.error : state?.issue === void 0 ? void 0 : translate(state.issue);
+    const message = state?.issue !== void 0 ? translate(state.issue) : typeof state?.error === "string" && state.error !== "" ? state.error : void 0;
     return { state: "error", label: STATUS_LABELS.error, message, restart: true };
   }
   if (phase === "closed" || info?.state === "exited") {
@@ -168,6 +162,14 @@ function statusOf(state) {
   }
   return { state: "connecting", label: STATUS_LABELS.connecting };
 }
+
+// src/terminal-panel.jsx
+var VIEW_KEY = "dsh-terminal-bottom";
+var CONTENT_ID = "dsh-terminal-bottom";
+var FALLBACK_THEME = Object.freeze({
+  fontSizes: { terminal: 13 },
+  fontFamilies: { terminal: "" }
+});
 function BottomTerminal({ ctx, sessionId, retention }) {
   const [Body, setBody] = import_react.default.useState(null);
   const [error, setError] = import_react.default.useState("");

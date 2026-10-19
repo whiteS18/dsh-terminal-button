@@ -16,6 +16,7 @@
  */
 import React from 'react'
 import { loadOfficialTerminalBody } from './official-terminal.js'
+import { statusOf, translate } from './terminal-status.js'
 
 /** View key and content identity: one bottom terminal per Session. */
 const VIEW_KEY = 'dsh-terminal-bottom'
@@ -26,78 +27,6 @@ const FALLBACK_THEME = Object.freeze({
   fontSizes: { terminal: 13 },
   fontFamilies: { terminal: '' },
 })
-
-/**
- * Official terminal copy (the same strings the official sidebar terminal uses),
- * so the shared component reads naturally in the bottom panel too.
- */
-const MESSAGES = {
-  new: '新建终端',
-  loading: '正在读取终端环境…',
-  creating: '正在启动…',
-  connecting: '正在连接…',
-  disconnected: '连接已断开。',
-  reconnect: '重新连接',
-  readonly: '此页面当前只读。',
-  control: '接管输入',
-  closed: '终端已关闭。',
-  exited: '进程已退出（{code}）',
-  failed: '终端错误：{message}',
-  unavailable: '不可用',
-  retry: '重试',
-  missingTerminal: '此终端已不存在，请新建终端。',
-  inputFull: '输入缓冲区已满，请重新连接后重试。',
-  attachmentEnded: '终端连接已结束，请重新连接。',
-  invalidOutput: '终端画面传输异常，请重新连接。',
-  terminalLimit: '终端数量已达上限，请关闭不用的终端后重试。已退出的终端也计入数量。',
-}
-
-/**
- * Translate one official terminal message key.
- *
- * @param {string} key - copy key or an unknown state name.
- * @param {Record<string, unknown>} [params] - `{name}` interpolation values.
- * @returns {string} the localized message.
- */
-function translate(key, params) {
-  const template = MESSAGES[key] ?? String(key ?? '')
-  if (params === undefined || params === null) return template
-  return template.replace(/\{(\w+)\}/g, (match, name) => (
-    name in params ? String(params[name]) : match
-  ))
-}
-
-/** Bottom status-bar badge states, matching the pre-0.4 panel. */
-const STATUS_LABELS = {
-  connecting: '连接中',
-  ready: '运行中',
-  exit: '已退出',
-  error: '错误',
-}
-
-/**
- * Reduce one official view snapshot to the bottom status bar's badge/actions.
- *
- * @param {any} state - official `webTerminals` view snapshot.
- * @returns {{ state: string, label: string, message?: string, restart?: boolean }} status row.
- */
-function statusOf(state) {
-  const phase = state?.phase
-  const info = state?.info
-  if (phase === 'failed' || phase === 'disconnected' || info?.state === 'failed') {
-    const message = typeof state?.error === 'string' && state.error !== ''
-      ? state.error
-      : (state?.issue === undefined ? undefined : translate(state.issue))
-    return { state: 'error', label: STATUS_LABELS.error, message, restart: true }
-  }
-  if (phase === 'closed' || info?.state === 'exited') {
-    return { state: 'exit', label: STATUS_LABELS.exit, restart: true }
-  }
-  if (phase === 'connected' && info?.state === 'running') {
-    return { state: 'ready', label: STATUS_LABELS.ready }
-  }
-  return { state: 'connecting', label: STATUS_LABELS.connecting }
-}
 
 /**
  * Render the official terminal inside the bottom panel.
