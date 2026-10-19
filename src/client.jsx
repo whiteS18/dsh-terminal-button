@@ -48,6 +48,7 @@ import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import xtermCss from '@xterm/xterm/css/xterm.css'
 import { createPinnedRegistry } from './pinned-terminal.js'
+import { resolveLoopbackBase, webSocketUrl } from './loopback.js'
 import { createTerminalController } from './terminal-session.js'
 
 const { Menu } = primitives
@@ -203,26 +204,14 @@ function terminalFontFamily() {
   return cssVar('--ds-font-family-code', 'Consolas, "Courier New", monospace')
 }
 
-function loopbackBase() {
-  // Desktop loads the UI as dsh-app://desktop.loopback, which Chromium maps to
-  // the Host's loopback HTTP origin. A relative ws:// URL is not a valid
-  // WebSocket target there, so use the mapped HTTP origin explicitly.
-  if (window.location.protocol === 'dsh-app:') {
-    const boot = window.__DSH_BOOT__
-    const fromBoot = boot?.webUrl || boot?.url || boot?.origin
-    if (typeof fromBoot === 'string' && /^https?:\/\//.test(fromBoot)) return fromBoot.replace(/\/$/, '')
-    return 'http://127.0.0.1:19387'
-  }
-  return window.location.origin
-}
-
-function wsUrl(sessionId, cwd, cols, rows) {
-  const httpBase = loopbackBase()
-  const protocol = httpBase.startsWith('https:') ? 'wss:' : 'ws:'
-  const host = httpBase.replace(/^https?:\/\//, '')
+async function wsUrl(sessionId, cwd, cols, rows) {
+  // Desktop loads the UI as dsh-app://app, whose origin cannot address the Host:
+  // its loopback port is ephemeral (DSH 0.2 starts the Host with --port 0), so
+  // resolve it from the live boot payload instead of assuming a port.
+  const httpBase = await resolveLoopbackBase(window)
   const query = new URLSearchParams({ sessionId, cols: String(cols), rows: String(rows) })
   if (cwd) query.set('cwd', cwd)
-  return `${protocol}//${host}${WS_PATH}?${query}`
+  return webSocketUrl(httpBase, `${WS_PATH}?${query}`)
 }
 
 const STATE_LABEL = {

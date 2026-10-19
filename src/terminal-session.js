@@ -31,6 +31,8 @@ export function createTerminalController(env, { ctx, sessionId, cwdHint, onSnaps
   let didFocus = false
   let open = false
   let ws = null
+  /** True while a socket is being dialed (address resolution may be async). */
+  let connecting = false
   const pending = []
   const listeners = new Set()
   let snapshot = { state: 'connecting', info: null, boundCwd: cwdHint || '' }
@@ -156,63 +158,80 @@ export function createTerminalController(env, { ctx, sessionId, cwdHint, onSnaps
     } catch { /* hidden or zero-size */ }
   }
 
-  const connect = () => {
-    if (disposed || ws || !attached) return
-    safeFit()
-    ws = new WebSocket(wsUrl(sessionId, cwdHint, Math.max(minCols, term.cols), Math.max(minRows, term.rows)))
-    ws.binaryType = 'arraybuffer'
+  const connect = async () => {
+    if (disposed || ws || connecting || !attached) return
+    // A second connect() may race this one while the Host origin is resolved
+    // (Desktop exposes it through an async IPC payload); the guard keeps one
+    // socket per controller.
+    connecting = true
+    try {
+      safeFit()
+      const url = await wsUrl(sessionId, cwdHint, Math.max(minCols, term.cols), Math.max(minRows, term.rows))
+      if (disposed || ws || !attached) return
+      ws = new WebSocket(url)
+      ws.binaryType = 'arraybuffer'
 
-    ws.onopen = () => {
-      open = true
-      for (const message of pending.splice(0)) ws.send(JSON.stringify(message))
-    }
-    ws.onmessage = (event) => {
-      if (disposed) return
-      if (typeof event.data === 'string') {
-        let control
-        try {
-          control = JSON.parse(event.data)
-        } catch {
+      ws.onopen = () => {
+        open = true
+        for (const message of pending.splice(0)) ws.send(JSON.stringify(message))
+      }
+      ws.onmessage = (event) => {
+        if (disposed) return
+        if (typeof event.data === 'string') {
+          let control
+          try {
+            control = JSON.parse(event.data)
+          } catch {
+            return
+          }
+          if (control?.type === 'ready') {
+            publish({
+              state: 'ready',
+              info: { cwd: control.cwd, shell: control.shell, pid: control.pid },
+            })
+          } else if (control?.type === 'exit') {
+            publish({ state: 'exit' })
+            publishInfo((prev) => ({ ...prev, exitCode: control.exitCode }))
+            term.write(`\r\n\x1b[2m[进程已退出，退出码 ${String(control.exitCode ?? '?')}]\x1b[0m\r\n`)
+          } else if (control?.type === 'error') {
+            publish({
+              state: 'error',
+              info: { message: control.message },
+            })
+            term.write(`\r\n\x1b[31m${control.message}\x1b[0m\r\n`)
+          }
           return
         }
-        if (control?.type === 'ready') {
-          publish({
-            state: 'ready',
-            info: { cwd: control.cwd, shell: control.shell, pid: control.pid },
-          })
-        } else if (control?.type === 'exit') {
-          publish({ state: 'exit' })
-          publishInfo((prev) => ({ ...prev, exitCode: control.exitCode }))
-          term.write(`\r\n\x1b[2m[进程已退出，退出码 ${String(control.exitCode ?? '?')}]\x1b[0m\r\n`)
-        } else if (control?.type === 'error') {
-          publish({
-            state: 'error',
-            info: { message: control.message },
-          })
-          term.write(`\r\n\x1b[31m${control.message}\x1b[0m\r\n`)
+        term.write(new Uint8Array(event.data))
+      }
+      ws.onclose = (event) => {
+        if (disposed) return
+        // A close during the handshake is a connection failure, not a shell exit.
+        // Browsers give no detail on onerror; the close code is the only signal.
+        publishState((prev) => {
+          if (prev === 'ready') return 'exit'
+          if (prev === 'connecting') return 'error'
+          return prev
+        })
+        if (event && event.code !== 1000) {
+          const detail = `WebSocket 已关闭（code ${event.code}${event.reason ? `：${event.reason}` : ''}）`
+          publishInfo((prev) => (prev?.message ? prev : { ...prev, message: detail }))
         }
-        return
       }
-      term.write(new Uint8Array(event.data))
-    }
-    ws.onclose = (event) => {
-      if (disposed) return
-      // A close during the handshake is a connection failure, not a shell exit.
-      // Browsers give no detail on onerror; the close code is the only signal.
-      publishState((prev) => {
-        if (prev === 'ready') return 'exit'
-        if (prev === 'connecting') return 'error'
-        return prev
+      ws.onerror = () => {
+        if (disposed) return
+        publishState((prev) => (prev === 'connecting' ? 'error' : prev))
+        publishInfo((prev) => (prev?.message ? prev : { message: 'WebSocket 连接失败' }))
+      }
+    } catch (error) {
+      // Address resolution failed (the shell exposed no Host origin): report it
+      // instead of leaving the panel stuck on "连接中" forever.
+      publish({
+        state: 'error',
+        info: { message: `无法解析终端地址：${error?.message ?? error}` },
       })
-      if (event && event.code !== 1000) {
-        const detail = `WebSocket 已关闭（code ${event.code}${event.reason ? `：${event.reason}` : ''}）`
-        publishInfo((prev) => (prev?.message ? prev : { ...prev, message: detail }))
-      }
-    }
-    ws.onerror = () => {
-      if (disposed) return
-      publishState((prev) => (prev === 'connecting' ? 'error' : prev))
-      publishInfo((prev) => (prev?.message ? prev : { message: 'WebSocket 连接失败' }))
+    } finally {
+      connecting = false
     }
   }
 

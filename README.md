@@ -52,6 +52,7 @@ dsh-terminal-button/
 ├── frames.js          # RFC 6455 帧编解码（被 index.js 和单测共用）
 ├── client.js          # Client 半部（构建产物，勿手改）：侧栏 Tab + 底部抽屉 + 设置行
 ├── src/client.jsx     # Client 源码（esbuild 打包，xterm/CSS 内联）
+├── src/loopback.js    # Host 回环地址解析：桌面版动态端口 / 浏览器同源
 ├── src/pinned-terminal.js    # 底部 dock 的页面级终端 registry（detach/attach 复用）
 ├── src/terminal-session.js   # xterm + WebSocket 会话封装
 ├── build.mjs          # 构建脚本：npm run build
@@ -59,6 +60,7 @@ dsh-terminal-button/
 ├── cordis.patch.yml   # bundle 组合补丁
 ├── test/frames.test.js      # WebSocket 帧编解码单测：npm test
 ├── test/config.test.js      # 配置项 volatile 声明单测：npm test
+├── test/loopback.test.js    # Host 回环地址解析单测：npm test
 ├── test/pinned-terminal.test.js  # pinned registry 单测：npm test
 └── script/integration-test.mjs  # 真实 PTY 端到端集成测试（需本机装有 DSH Desktop）
 ```
@@ -81,6 +83,13 @@ dsh-terminal-button/
   按钮注册到 `conversation.session.header.actions`（order 30），按配置分发到侧栏或底部；
   「终端显示位置」注册到插件详情的 `plugins.bundle.config`（包名 `dsh-terminal-button`），
   值经 `configForms.get('terminal-plugin')` 写入 profile patch；DSH 0.1.5 及更早仍走 `settings.general.item`。
+- **Host 地址解析**（`src/loopback.js`）：桌面版 Host 的端口是**动态**的（DSH 0.2 起以 `--port 0` 启动），
+  页面又跑在 `dsh-app://app` 下、文档 origin 不能当 WebSocket 基址，所以绝对地址按以下顺序解析：
+  `globalThis.__DSH_TRANSPORT__.streamBaseUrl`（DSH ≥ 0.2，启动时由 Web 应用注入）→
+  旧版 `window.__DSH_BOOT__.webUrl / url / origin` → `dshDesktopBoot.ready()` 的 IPC 载荷 →
+  最后才回退到历史固定端口 `19387`。浏览器（`dsh web`）直接用同源 `location.origin`。
+  **不要**再从 `window.__DSH_BOOT__` 里取 `webUrl`：DSH 0.2 起它是客户端模块清单，不带 URL；
+  也不要写死端口，否则 Host 换端口后终端会报「WebSocket 连接失败」。
 - **协议**：
   - client → host：`{type:'input', data}` / `{type:'resize', cols, rows}`
   - host → client：二进制帧 = 终端输出；文本帧 = `{type:'ready', cwd, shell, pid}` / `{type:'exit', exitCode, signal}` / `{type:'error', message}`
@@ -93,9 +102,11 @@ npm run build   # src/client.jsx -> client.js
 npm test        # node --test
 ```
 
-改完 `src/client.jsx` 必须重新 `npm run build`；改完任意文件后重启 DSH Desktop 生效。
+改完 `src/*.jsx|js` 必须重新 `npm run build`，然后在 DSH 窗口里刷新页面（桌面版 `Ctrl+R`）即可加载新的
+`client.js`；改了 `index.js`（Host 半部）或插件清单/版本则需完全重启 DSH Desktop。
 
 ## 调试
 
-- DSH 标题栏扳手图标 → Developer Tools（或 `Ctrl+Shift+I`），Console 里可查 `window.__DSH_BOOT__` / `window.__ModuleLoader__`
+- DSH 标题栏扳手图标 → Developer Tools（或 `Ctrl+Shift+I`），Console 里可查 `window.__DSH_TRANSPORT__`
+  （桌面版 Host 基址 `streamBaseUrl`）/ `window.__DSH_BOOT__`（客户端模块清单）/ `window.__ModuleLoader__`
 - `curl http://127.0.0.1:<port>/dsh-terminal/health` 验证 Host 半部

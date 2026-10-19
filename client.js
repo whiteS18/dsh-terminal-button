@@ -6414,6 +6414,42 @@ function createPinnedRegistry() {
   };
 }
 
+// src/loopback.js
+var HTTP_BASE = /^https?:\/\//i;
+function httpBase(value) {
+  if (typeof value !== "string" || !HTTP_BASE.test(value)) return void 0;
+  return value.replace(/\/+$/, "");
+}
+function loopbackBaseFrom(scope) {
+  const location = scope?.location;
+  if (!location || location.protocol !== "dsh-app:") {
+    return httpBase(location?.origin) ?? (location?.origin || void 0);
+  }
+  const fromTransport = httpBase(scope?.__DSH_TRANSPORT__?.streamBaseUrl);
+  if (fromTransport) return fromTransport;
+  const boot = scope?.__DSH_BOOT__;
+  return httpBase(boot?.webUrl) ?? httpBase(boot?.url) ?? httpBase(boot?.origin);
+}
+async function resolveLoopbackBase(scope) {
+  const known = loopbackBaseFrom(scope);
+  if (known) return known;
+  const desktopBoot = scope?.dshDesktopBoot;
+  if (typeof desktopBoot?.ready === "function") {
+    try {
+      const payload = await desktopBoot.ready();
+      const fromIpc = httpBase(payload?.streamBaseUrl);
+      if (fromIpc) return fromIpc;
+    } catch {
+    }
+  }
+  return "http://127.0.0.1:19387";
+}
+function webSocketUrl(base, path) {
+  const origin = httpBase(base);
+  if (!origin) throw new Error(`invalid terminal host base: ${String(base)}`);
+  return `${origin.replace(/^http/i, "ws")}${path}`;
+}
+
 // src/terminal-session.js
 var import_xterm = __toESM(require_xterm(), 1);
 var import_addon_fit = __toESM(require_addon_fit(), 1);
@@ -6436,6 +6472,7 @@ function createTerminalController(env, { ctx, sessionId, cwdHint, onSnapshot }) 
   let didFocus = false;
   let open = false;
   let ws = null;
+  let connecting = false;
   const pending = [];
   const listeners = /* @__PURE__ */ new Set();
   let snapshot = { state: "connecting", info: null, boundCwd: cwdHint || "" };
@@ -6540,65 +6577,77 @@ function createTerminalController(env, { ctx, sessionId, cwdHint, onSnapshot }) 
     } catch {
     }
   }
-  const connect = () => {
-    if (disposed || ws || !attached) return;
-    safeFit();
-    ws = new WebSocket(wsUrl2(sessionId, cwdHint, Math.max(minCols, term.cols), Math.max(minRows, term.rows)));
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      open = true;
-      for (const message of pending.splice(0)) ws.send(JSON.stringify(message));
-    };
-    ws.onmessage = (event) => {
-      if (disposed) return;
-      if (typeof event.data === "string") {
-        let control;
-        try {
-          control = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (control?.type === "ready") {
-          publish({
-            state: "ready",
-            info: { cwd: control.cwd, shell: control.shell, pid: control.pid }
-          });
-        } else if (control?.type === "exit") {
-          publish({ state: "exit" });
-          publishInfo((prev) => ({ ...prev, exitCode: control.exitCode }));
-          term.write(`\r
+  const connect = async () => {
+    if (disposed || ws || connecting || !attached) return;
+    connecting = true;
+    try {
+      safeFit();
+      const url = await wsUrl2(sessionId, cwdHint, Math.max(minCols, term.cols), Math.max(minRows, term.rows));
+      if (disposed || ws || !attached) return;
+      ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        open = true;
+        for (const message of pending.splice(0)) ws.send(JSON.stringify(message));
+      };
+      ws.onmessage = (event) => {
+        if (disposed) return;
+        if (typeof event.data === "string") {
+          let control;
+          try {
+            control = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          if (control?.type === "ready") {
+            publish({
+              state: "ready",
+              info: { cwd: control.cwd, shell: control.shell, pid: control.pid }
+            });
+          } else if (control?.type === "exit") {
+            publish({ state: "exit" });
+            publishInfo((prev) => ({ ...prev, exitCode: control.exitCode }));
+            term.write(`\r
 \x1B[2m[\u8FDB\u7A0B\u5DF2\u9000\u51FA\uFF0C\u9000\u51FA\u7801 ${String(control.exitCode ?? "?")}]\x1B[0m\r
 `);
-        } else if (control?.type === "error") {
-          publish({
-            state: "error",
-            info: { message: control.message }
-          });
-          term.write(`\r
+          } else if (control?.type === "error") {
+            publish({
+              state: "error",
+              info: { message: control.message }
+            });
+            term.write(`\r
 \x1B[31m${control.message}\x1B[0m\r
 `);
+          }
+          return;
         }
-        return;
-      }
-      term.write(new Uint8Array(event.data));
-    };
-    ws.onclose = (event) => {
-      if (disposed) return;
-      publishState((prev) => {
-        if (prev === "ready") return "exit";
-        if (prev === "connecting") return "error";
-        return prev;
+        term.write(new Uint8Array(event.data));
+      };
+      ws.onclose = (event) => {
+        if (disposed) return;
+        publishState((prev) => {
+          if (prev === "ready") return "exit";
+          if (prev === "connecting") return "error";
+          return prev;
+        });
+        if (event && event.code !== 1e3) {
+          const detail = `WebSocket \u5DF2\u5173\u95ED\uFF08code ${event.code}${event.reason ? `\uFF1A${event.reason}` : ""}\uFF09`;
+          publishInfo((prev) => prev?.message ? prev : { ...prev, message: detail });
+        }
+      };
+      ws.onerror = () => {
+        if (disposed) return;
+        publishState((prev) => prev === "connecting" ? "error" : prev);
+        publishInfo((prev) => prev?.message ? prev : { message: "WebSocket \u8FDE\u63A5\u5931\u8D25" });
+      };
+    } catch (error) {
+      publish({
+        state: "error",
+        info: { message: `\u65E0\u6CD5\u89E3\u6790\u7EC8\u7AEF\u5730\u5740\uFF1A${error?.message ?? error}` }
       });
-      if (event && event.code !== 1e3) {
-        const detail = `WebSocket \u5DF2\u5173\u95ED\uFF08code ${event.code}${event.reason ? `\uFF1A${event.reason}` : ""}\uFF09`;
-        publishInfo((prev) => prev?.message ? prev : { ...prev, message: detail });
-      }
-    };
-    ws.onerror = () => {
-      if (disposed) return;
-      publishState((prev) => prev === "connecting" ? "error" : prev);
-      publishInfo((prev) => prev?.message ? prev : { message: "WebSocket \u8FDE\u63A5\u5931\u8D25" });
-    };
+    } finally {
+      connecting = false;
+    }
   };
   const dataSub = term.onData((data) => send({ type: "input", data }));
   const resizeSub = term.onResize(({ cols, rows }) => send({
@@ -6810,22 +6859,11 @@ function readTheme() {
 function terminalFontFamily() {
   return cssVar("--ds-font-family-code", 'Consolas, "Courier New", monospace');
 }
-function loopbackBase() {
-  if (window.location.protocol === "dsh-app:") {
-    const boot = window.__DSH_BOOT__;
-    const fromBoot = boot?.webUrl || boot?.url || boot?.origin;
-    if (typeof fromBoot === "string" && /^https?:\/\//.test(fromBoot)) return fromBoot.replace(/\/$/, "");
-    return "http://127.0.0.1:19387";
-  }
-  return window.location.origin;
-}
-function wsUrl(sessionId, cwd, cols, rows) {
-  const httpBase = loopbackBase();
-  const protocol = httpBase.startsWith("https:") ? "wss:" : "ws:";
-  const host = httpBase.replace(/^https?:\/\//, "");
+async function wsUrl(sessionId, cwd, cols, rows) {
+  const httpBase2 = await resolveLoopbackBase(window);
   const query = new URLSearchParams({ sessionId, cols: String(cols), rows: String(rows) });
   if (cwd) query.set("cwd", cwd);
-  return `${protocol}//${host}${WS_PATH}?${query}`;
+  return webSocketUrl(httpBase2, `${WS_PATH}?${query}`);
 }
 var STATE_LABEL = {
   connecting: "\u8FDE\u63A5\u4E2D",
