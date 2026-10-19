@@ -67,6 +67,38 @@ function translate(key, params) {
   ))
 }
 
+/** Bottom status-bar badge states, matching the pre-0.4 panel. */
+const STATUS_LABELS = {
+  connecting: '连接中',
+  ready: '运行中',
+  exit: '已退出',
+  error: '错误',
+}
+
+/**
+ * Reduce one official view snapshot to the bottom status bar's badge/actions.
+ *
+ * @param {any} state - official `webTerminals` view snapshot.
+ * @returns {{ state: string, label: string, message?: string, restart?: boolean }} status row.
+ */
+function statusOf(state) {
+  const phase = state?.phase
+  const info = state?.info
+  if (phase === 'failed' || phase === 'disconnected' || info?.state === 'failed') {
+    const message = typeof state?.error === 'string' && state.error !== ''
+      ? state.error
+      : (state?.issue === undefined ? undefined : translate(state.issue))
+    return { state: 'error', label: STATUS_LABELS.error, message, restart: true }
+  }
+  if (phase === 'closed' || info?.state === 'exited') {
+    return { state: 'exit', label: STATUS_LABELS.exit, restart: true }
+  }
+  if (phase === 'connected' && info?.state === 'running') {
+    return { state: 'ready', label: STATUS_LABELS.ready }
+  }
+  return { state: 'connecting', label: STATUS_LABELS.connecting }
+}
+
 /**
  * Render the official terminal inside the bottom panel.
  *
@@ -170,6 +202,21 @@ export function BottomTerminal({ ctx, sessionId, retention }) {
 
   const viewOf = React.useCallback(() => view, [view])
 
+  // Always subscribed (hook order is stable): the bottom status bar mirrors the
+  // view state the official body renders the terminal screen from.
+  const initialSnapshot = React.useMemo(() => ({ phase: 'loading', writable: false }), [])
+  const subscribeState = React.useCallback(
+    (callback) => (view === null ? () => {} : view.state.subscribe(callback)),
+    [view],
+  )
+  const readState = React.useCallback(
+    () => (view === null ? initialSnapshot : view.state.getSnapshot()),
+    [view, initialSnapshot],
+  )
+  const state = React.useSyncExternalStore(subscribeState, readState)
+  const status = statusOf(state)
+  const shownPath = status.message ?? state.info?.cwd ?? state.environment?.cwd ?? ''
+
   if (error !== '') {
     return <div className="dsh-term-message" role="alert">{error}</div>
   }
@@ -177,12 +224,21 @@ export function BottomTerminal({ ctx, sessionId, retention }) {
     return <div className="dsh-term-message">正在加载官方终端…</div>
   }
   return (
-    <Body
-      useTabInfo={useTabInfo}
-      useTerminal={useTerminal}
-      useTheme={useTheme}
-      view={viewOf}
-      t={translate}
-    />
+    <>
+      <Body
+        useTabInfo={useTabInfo}
+        useTerminal={useTerminal}
+        useTheme={useTheme}
+        view={viewOf}
+        t={translate}
+      />
+      <div className="dsh-term-status">
+        <span className="dsh-term-badge" data-state={status.state}>{status.label}</span>
+        <span className="dsh-term-status-path" title={shownPath}>{shownPath}</span>
+        {status.restart
+          ? <button type="button" className="dsh-term-restart" onClick={restart}>重开终端</button>
+          : null}
+      </div>
+    </>
   )
 }

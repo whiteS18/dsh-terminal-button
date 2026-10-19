@@ -57,15 +57,36 @@ const BUNDLE_KEY = 'dsh-terminal-button'
 const POSITION_KEY = 'position'
 
 const CSS = [
+  // The bottom dock is appended to the composer's bottom flex row — a
+  // horizontal line it shares with the context (token) meter, which would
+  // squeeze the panel into the middle. The :has() rule below turns that row
+  // into a wrapping, full-width line so the dock (order: 1, basis > 100%)
+  // lands on its own row BELOW the meter, and the negative side margins cancel
+  // the composer root's side clearance so the panel spans the whole
+  // conversation column (main-area width) and rises from the bottom edge.
+  // The conversation column's width-drag handle (._widthHandle) is absolutely
+  // positioned over the content's right edge in a stacking context we cannot
+  // out-z-index from inside the slot — so keep the dock head's controls clear
+  // of that strip with right padding.
+  'div:has(> [data-slot="conversation.composer.dock"] > .dsh-term-dock){width:100%;flex-wrap:wrap}',
   '.dsh-term-dock{order:1;flex:none;box-sizing:border-box;width:calc(100% + var(--dsh-composer-side-clearance,16px) * 2);margin:0 calc(var(--dsh-composer-side-clearance,16px) * -1);position:relative;z-index:30;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:12px;overflow:hidden}',
+  '.dsh-term-dock-head{position:relative;z-index:31;padding-right:52px}',
   '.dsh-term-dock-drag{flex:none;height:5px;cursor:row-resize}',
   '.dsh-term-dock-drag:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18))}',
   '.dsh-term-dock-head{flex:none;display:flex;align-items:center;gap:8px;padding:6px 10px 4px;color:var(--dsw-alias-label-secondary,#ccc);font-size:12px}',
   '.dsh-term-dock-head svg{width:14px;height:14px}',
   '.dsh-term-dock-head-title{font-weight:500}',
   '.dsh-term-dock-head-cwd{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;direction:rtl;text-align:left}',
-  '.dsh-term-dock-body{flex:none;min-height:0;overflow:hidden}',
-  '.dsh-term-dock-body>section{height:100%}',
+  '.dsh-term-dock-body{flex:none;min-height:0;overflow:hidden;display:flex;flex-direction:column}',
+  '.dsh-term-dock-body>[data-sidebar-terminal]{flex:1;min-height:0;height:auto}',
+  // bottom status row — same metrics as the pre-0.4 panel
+  '.dsh-term-status{display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.2));font-size:11px;color:var(--dsw-alias-label-tertiary,#999);white-space:nowrap;overflow:hidden;flex:none}',
+  '.dsh-term-status-path{overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left;flex:1}',
+  '.dsh-term-badge{flex:none;padding:1px 6px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12))}',
+  '.dsh-term-badge[data-state="exit"],.dsh-term-badge[data-state="error"]{color:var(--dsw-alias-state-error-primary,#f85149)}',
+  '.dsh-term-badge[data-state="ready"]{color:var(--dsw-alias-state-success-primary,#3fb950)}',
+  '.dsh-term-restart{flex:none;border:none;border-radius:6px;padding:2px 8px;cursor:pointer;background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12));color:var(--dsw-alias-label-secondary,#ccc);font-size:11px}',
+  '.dsh-term-restart:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.2))}',
   '.dsh-term-iconbtn{width:24px;height:24px;flex:none;border:none;border-radius:6px;background:0 0;color:var(--dsw-alias-label-tertiary,#999);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:4px}',
   '.dsh-term-iconbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15));color:var(--dsw-alias-label-secondary,#ccc)}',
   '.dsh-term-message{padding:12px 14px;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}',
@@ -87,11 +108,15 @@ const CSS = [
 ].join('\n')
 
 function injectStyle() {
-  if (document.querySelector('style[data-plugin="dsh-terminal-button"]') !== null) return
-  const el = document.createElement('style')
-  el.setAttribute('data-plugin', name)
+  // Reuse an existing tag when the client bundle hot-reloads so the newest
+  // stylesheet (including the composer-row wrap rule) replaces the old text.
+  let el = document.querySelector('style[data-plugin="dsh-terminal-button"]')
+  if (el === null) {
+    el = document.createElement('style')
+    el.setAttribute('data-plugin', name)
+    document.head.append(el)
+  }
   el.textContent = CSS
-  document.head.append(el)
 }
 
 /** Lucide "square-terminal" — the same icon as DSH Desktop's native titlebar terminal button. */
