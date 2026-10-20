@@ -2,6 +2,20 @@
 
 本文件记录 `dsh-terminal-button` 的版本变更。版本号遵循 SemVer；格式参考 Keep a Changelog。
 
+## 0.4.4 — 2026-10-20
+
+### 修复
+
+- **恢复底部终端的复制/粘贴快捷键**：0.4.0 改用官方 `TerminalBody` 后，插件自己那套 `attachCustomKeyEventHandler` / 剪贴板处理被删除，面板里 `Ctrl+Shift+C` 不能复制、`Ctrl+Shift+V`（以及 Windows/Linux 的 `Ctrl+V`）不能粘贴，只剩浏览器原生菜单和 Ctrl+Insert/Shift+Insert。现在在面板正文上挂一个 DOM 层桥接：
+  - `Ctrl+Shift+C`：先确认官方 xterm 当前有选区，再让浏览器执行 copy 命令；官方 xterm 会把选区写入 `clipboardData`，选区模型仍由官方渲染器维护。
+  - `Ctrl+Shift+V`（Windows/Linux 另有 `Ctrl+V`）：读取剪贴板文本后，以 `paste` 事件回放给 xterm 的 helper textarea，保留官方的括号粘贴（bracketed paste）与换行处理。
+  - 只吃这几组组合键：`Ctrl+C` 仍是 SIGINT 中断，macOS 的 `Cmd+C` / `Cmd+V`、鼠标选择、右键菜单与普通输入不受影响。
+- `npm test` 在 Windows 上不再因 `test/*.test.js` 不被 shell 展开而报 “Could not find”；改为把 `test/` 目录交给 Node 测试运行器。
+
+### 说明
+
+- 该桥接不接管 xterm、不复制 PTY/传输逻辑；官方终端渲染器升级后若 `.xterm-selection` 的 DOM 结构变化，复制会安全地退化为「无操作」（不会误清空剪贴板）。
+
 ## 0.4.3 — 2026-10-19
 
 ### 新增

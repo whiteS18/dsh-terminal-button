@@ -29,6 +29,7 @@ import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import { createRetentionBridge } from './terminal-retention.js'
 import { BottomTerminal } from './terminal-panel.jsx'
+import { installTerminalClipboard } from './terminal-clipboard.js'
 import { normalizePosition, POSITIONS } from './position.js'
 import { shouldCollapseDock } from './dock-visibility.js'
 
@@ -340,6 +341,16 @@ function TerminalDock(props, ctx) {
   const cwdHint = typeof useSessions === 'function'
     ? useSessions((sessions) => sessions.byId?.[sessionId]?.cwd)
     : undefined
+  const bodyRef = React.useRef(null)
+
+  // Reinstate the copy/paste shortcuts the pre-0.4 panel implemented with its
+  // own xterm. The official screen keeps ownership of the selection model; the
+  // bridge only replays the browser copy command (Ctrl+Shift+C) and xterm's
+  // own paste event (Ctrl+Shift+V / Ctrl+V) on top of it.
+  React.useEffect(() => {
+    if (!dock?.open) return undefined
+    return installTerminalClipboard(bodyRef.current)
+  }, [dock?.open, sessionId])
 
   const onDragStart = React.useCallback((event) => {
     event.preventDefault()
@@ -377,7 +388,7 @@ function TerminalDock(props, ctx) {
           <CloseGlyph />
         </button>
       </div>
-      <div className="dsh-term-dock-body" style={{ height: dock.height ?? 260 }}>
+      <div className="dsh-term-dock-body" ref={bodyRef} style={{ height: dock.height ?? 260 }}>
         {sessionId
           ? <BottomTerminal key={sessionId} ctx={ctx} sessionId={sessionId} retention={retentionBridge} />
           : <div className="dsh-term-message">请先在会话中打开终端</div>}

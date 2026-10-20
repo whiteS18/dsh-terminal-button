@@ -304,6 +304,92 @@ function BottomTerminal({ ctx, sessionId, retention }) {
   ), /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-term-status" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-badge", "data-state": status.state }, status.label), /* @__PURE__ */ import_react.default.createElement("span", { className: "dsh-term-status-path", title: shownPath }, shownPath), status.restart ? /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-term-restart", onClick: restart }, "\u91CD\u5F00\u7EC8\u7AEF") : null));
 }
 
+// src/terminal-clipboard.js
+var TERMINAL_SELECTOR = ".xterm";
+var TEXTAREA_SELECTOR = "textarea.xterm-helper-textarea";
+var SELECTION_SELECTOR = ".xterm-selection";
+function isMacPlatform(navigatorLike) {
+  const platform = navigatorLike?.userAgentData?.platform ?? navigatorLike?.platform ?? "";
+  return /mac|iphone|ipad|ipod/iu.test(platform);
+}
+function clipboardAction(event, mac = false) {
+  if (!event || event.isComposing || event.altKey || event.repeat) return null;
+  if (event.metaKey) return null;
+  const ctrl = event.ctrlKey === true;
+  if (!ctrl) return null;
+  const shift = event.shiftKey === true;
+  if (event.code === "KeyC" && shift) return "copy";
+  if (event.code === "KeyV" && shift) return "paste";
+  if (event.code === "KeyV" && !shift && mac !== true) return "paste";
+  return null;
+}
+function hasSelection(xterm) {
+  const layer = xterm?.querySelector?.(SELECTION_SELECTOR);
+  return (layer?.childElementCount ?? 0) > 0;
+}
+function copySelection(xterm, documentLike) {
+  if (!hasSelection(xterm)) return false;
+  const textarea = xterm.querySelector?.(TEXTAREA_SELECTOR);
+  if (!textarea) return false;
+  if (documentLike?.activeElement !== textarea) textarea.focus?.();
+  try {
+    return documentLike?.execCommand?.("copy") === true;
+  } catch {
+    return false;
+  }
+}
+async function pasteClipboard(xterm, options = {}) {
+  if (!xterm) return false;
+  const clipboard = options.clipboard ?? globalThis.navigator?.clipboard;
+  if (typeof clipboard?.readText !== "function") return false;
+  let text;
+  try {
+    text = await clipboard.readText();
+  } catch {
+    return false;
+  }
+  if (typeof text !== "string" || text === "") return false;
+  const ClipboardEventCtor = options.ClipboardEvent ?? globalThis.ClipboardEvent;
+  const DataTransferCtor = options.DataTransfer ?? globalThis.DataTransfer;
+  if (typeof ClipboardEventCtor !== "function" || typeof DataTransferCtor !== "function") return false;
+  const data = new DataTransferCtor();
+  data.setData("text/plain", text);
+  const target = xterm.querySelector?.(TEXTAREA_SELECTOR) ?? xterm;
+  if (target.isConnected === false) return false;
+  target.dispatchEvent(new ClipboardEventCtor("paste", {
+    clipboardData: data,
+    bubbles: true,
+    cancelable: true
+  }));
+  return true;
+}
+function installTerminalClipboard(container, options = {}) {
+  if (typeof container?.addEventListener !== "function") return () => {
+  };
+  const documentLike = options.document ?? container.ownerDocument ?? globalThis.document;
+  const windowLike = options.window ?? documentLike?.defaultView;
+  const mac = options.mac ?? isMacPlatform(windowLike?.navigator);
+  const onKeyDown = (event) => {
+    const action = clipboardAction(event, mac);
+    if (action === null) return;
+    const target = event.target;
+    if (typeof target?.closest !== "function") return;
+    const xterm = target.closest(TERMINAL_SELECTOR);
+    if (xterm === null) return;
+    if (typeof container.contains === "function" && !container.contains(xterm)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (action === "copy") {
+      copySelection(xterm, documentLike);
+      return;
+    }
+    pasteClipboard(xterm, options).catch(() => {
+    });
+  };
+  container.addEventListener("keydown", onKeyDown, true);
+  return () => container.removeEventListener("keydown", onKeyDown, true);
+}
+
 // src/position.js
 var POSITIONS = {
   bottom: "\u5E95\u90E8\u9762\u677F",
@@ -533,6 +619,11 @@ function TerminalDock(props, ctx) {
   const { sessionId, useSessions } = props;
   const dock = useDock();
   const cwdHint = typeof useSessions === "function" ? useSessions((sessions) => sessions.byId?.[sessionId]?.cwd) : void 0;
+  const bodyRef = import_react2.default.useRef(null);
+  import_react2.default.useEffect(() => {
+    if (!dock?.open) return void 0;
+    return installTerminalClipboard(bodyRef.current);
+  }, [dock?.open, sessionId]);
   const onDragStart = import_react2.default.useCallback((event) => {
     event.preventDefault();
     const startY = event.clientY;
@@ -560,7 +651,7 @@ function TerminalDock(props, ctx) {
       onClick: () => closeDock()
     },
     /* @__PURE__ */ import_react2.default.createElement(CloseGlyph, null)
-  )), /* @__PURE__ */ import_react2.default.createElement("div", { className: "dsh-term-dock-body", style: { height: dock.height ?? 260 } }, sessionId ? /* @__PURE__ */ import_react2.default.createElement(BottomTerminal, { key: sessionId, ctx, sessionId, retention: retentionBridge }) : /* @__PURE__ */ import_react2.default.createElement("div", { className: "dsh-term-message" }, "\u8BF7\u5148\u5728\u4F1A\u8BDD\u4E2D\u6253\u5F00\u7EC8\u7AEF")));
+  )), /* @__PURE__ */ import_react2.default.createElement("div", { className: "dsh-term-dock-body", ref: bodyRef, style: { height: dock.height ?? 260 } }, sessionId ? /* @__PURE__ */ import_react2.default.createElement(BottomTerminal, { key: sessionId, ctx, sessionId, retention: retentionBridge }) : /* @__PURE__ */ import_react2.default.createElement("div", { className: "dsh-term-message" }, "\u8BF7\u5148\u5728\u4F1A\u8BDD\u4E2D\u6253\u5F00\u7EC8\u7AEF")));
 }
 function TerminalPositionSettingRow() {
   const position = usePosition();

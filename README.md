@@ -2,13 +2,14 @@
 
 DeepSeek Harness 插件：**官方终端（`@deepseek-ai/dsh-client-ui-sidebar-terminal`）的底部面板扩展**。
 
-DSH 0.2.1 起官方已内置右侧栏终端（PTY、传输、会话清单、主题、xterm 全部由官方实现）。从 **0.4.0** 起本插件不再重复实现终端，也不再注册自己的侧栏 Tab，而是把官方终端渲染到会话列底部，并补上官方没提供的桌面入口与命令 shim：
+DSH 0.2.1 起官方已内置右侧栏终端（PTY、传输、会话清单、主题、xterm 全部由官方实现）。从 **0.4.0** 起本插件不再重复实现终端，也不再注册自己的侧栏 Tab，而是把官方终端渲染到会话列底部，并补上官方没提供的桌面入口、复制/粘贴快捷键与命令 shim：
 
 - **底部面板**：在 `conversation.composer.dock` 渲染官方 `TerminalBody`（从官方包的懒加载 chunk `lib/client.terminal.js` 取用），数据来自官方客户端服务 `webTerminals`。没有插件自己的 PTY、WebSocket、xterm 或会话恢复逻辑。面板外层布局与 0.3.x 一致：composer 底部行整行换行、独占一行、与主界面同宽，顶部可拖拽调高度，头部显示会话 cwd，**底部保留状态行**（连接中 / 运行中 / 已退出 / 错误 + 路径 + 「重开终端」）。旧终端被 Host 回收/销毁后（重启、会话卸载、空闲回收），打开面板时会**自动新建**一个终端并在状态行提示，不需要手动点「新建终端」。
+- **复制/粘贴快捷键**：底部面板内 `Ctrl+Shift+C` 复制选区、`Ctrl+Shift+V` 粘贴（Windows/Linux 上 `Ctrl+V` 也粘贴）；`Ctrl+C` 仍是 SIGINT 中断，macOS 的 `Cmd+C` / `Cmd+V` 保持原生行为。插件只向官方 xterm 转发浏览器的 copy 命令与官方 paste 事件，选区模型和输入处理仍由官方渲染器负责（0.3.x 的这套快捷键在 0.4.0 重构时丢失，0.4.4 以 DOM 桥接方式补回）。
 - **桌面「打开终端」入口拦截**：托盘 / 设置页 / 标题栏的「打开终端」经 Host 端 patch `desktopRuntime.openTerminal` 重定向到底部面板（SSE `/dsh-terminal/events` 通知前端）；**系统弹窗**模式下放行原生行为，直接弹系统终端窗口。
 - **`dsh` 命令 shim**：桌面版没有独立的 `dsh` 可执行文件，官方终端启动子进程时只透传 `DSH_SESSION_ID`。插件 patch `ctx.subprocess.spawnTerminal`，把临时目录里的 `dsh.cmd` / `dsh` 前插到 PATH——**官方右侧栏终端与底部面板都生效**，且不会把任何 `DSH_*` 变量重新注入 shell。
 - **位置设置**：插件 → 插件列表 → 本插件详情里的「终端显示位置」，可选 **底部面板**（默认）或 **系统弹窗**；右侧栏终端由官方提供，旧配置里的 `sidebar` 会自动归一为底部面板。
-- **官方终端自带能力**：主题跟随、OSC 调色板、光标对比度、复制/选择、字体与字号设置、Shell 选择（官方默认 shell 与 `preferredShell`）、终端数量上限、跨刷新恢复等，全部由官方实现。
+- **官方终端自带能力**：主题跟随、OSC 调色板、光标对比度、鼠标选择、字体与字号设置、Shell 选择（官方默认 shell 与 `preferredShell`）、终端数量上限、跨刷新恢复等，全部由官方实现。
 - **新会话界面一致性**：进入「新会话」/空白会话界面（hero）时底部面板会收起，且**不会**在发出第一条消息后自己弹回来；只有明确点终端图标才重新挂出（监听会话主体的 `data-content-phase="hero"`）。
 
 ## 兼容性
@@ -51,6 +52,7 @@ dsh-terminal-button/
 ├── src/terminal-panel.jsx    # 官方 TerminalBody 的底部面板接线（懒加载、view 生命周期、重启）
 ├── src/official-terminal.js  # 从官方包 chunk 加载 TerminalBody
 ├── src/terminal-retention.js # 无侧栏 Tab 的终端窗口 hold 桥接（包装 webTerminals.retainTabs）
+├── src/terminal-clipboard.js # 底部面板复制/粘贴快捷键（DOM 桥接官方 xterm 的 copy/paste 事件）
 ├── src/position.js           # 位置取值归一（sidebar → bottom）
 ├── src/dock-visibility.js    # 新会话（hero）界面收起策略
 ├── build.mjs         # esbuild 构建：npm run build
@@ -58,6 +60,7 @@ dsh-terminal-button/
 ├── test/host-apply.test.js        # Host 路由、spawn PATH patch、入口拦截单测
 ├── test/terminal-path.test.js     # PATH 合并且不泄露 DSH_* 单测
 ├── test/terminal-retention.test.js # 窗口 hold 桥接单测
+├── test/terminal-clipboard.test.js # 底部面板复制/粘贴快捷键单测
 ├── test/position.test.js          # 位置归一单测
 ├── test/dock-visibility.test.js   # hero 收起策略单测
 └── test/config.test.js            # Config.position volatile 声明单测
